@@ -1,5 +1,6 @@
 services:
   taskgraph:
+    image: budstudio/taskgraph:latest
     build: .
     ports:
       - "8484:8484"
