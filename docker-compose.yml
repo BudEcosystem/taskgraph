@@ -1,0 +1,13 @@
+services:
+  taskgraph:
+    build: .
+    ports:
+      - "8484:8484"
+    volumes:
+      - taskgraph-data:/data
+    environment:
+      - TASKGRAPH_DB=/data/taskgraph.db
+      - RUST_LOG=info
+
+volumes:
+  taskgraph-data:
