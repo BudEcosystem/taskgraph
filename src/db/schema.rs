@@ -193,9 +193,9 @@ pub fn init_db(path: &str) -> Result<Database> {
     conn.execute_batch(INDEX_TASK_NOTES_TASK)?;
     conn.execute_batch(INDEX_TASK_FILES_TASK)?;
     conn.execute_batch(INDEX_TASK_FILES_PATH)?;
-    conn.execute_batch(INDEX_PROJECTS_USER)?;
-    // Migration: add user_id column for existing databases
+    // Migration: add user_id column for existing databases (must run before index)
     let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN user_id TEXT;");
+    conn.execute_batch(INDEX_PROJECTS_USER)?;
     conn.execute_batch(CREATE_TASK_READINESS_VIEW)?;
     Ok(Database::from_connection(conn))
 }
