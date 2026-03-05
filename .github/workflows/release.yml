@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write
@@ -14,7 +21,24 @@ env:
   IMAGE_NAME: budstudio/taskgraph
 
 jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: resolve-tag
     strategy:
       matrix:
         include:
@@ -35,6 +59,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - name: Install Rust toolchain
         run: |
@@ -63,11 +89,13 @@ jobs:
           path: ${{ matrix.asset }}
 
   release:
-    needs: build
+    needs: [resolve-tag, build]
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -84,18 +112,21 @@ jobs:
           sha256sum taskgraph-* > checksums.txt
           cat checksums.txt
 
-      - name: Create GitHub release
+      - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.resolve-tag.outputs.tag }}
           generate_release_notes: true
           files: release/*
 
   docker:
-    needs: release
+    needs: [resolve-tag, release]
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-tag.outputs.tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -115,8 +146,8 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,value=${{ needs.resolve-tag.outputs.tag }},pattern={{version}}
+            type=semver,value=${{ needs.resolve-tag.outputs.tag }},pattern={{major}}.{{minor}}
             type=raw,value=latest
 
       - name: Build and push
