@@ -30,7 +30,13 @@ pub async fn run_server(db_path: &str, port: u16) -> Result<()> {
     let mcp_service = StreamableHttpService::new(
         move || Ok(TaskgraphMcpHandler::new(mcp_db.clone())),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig {
+            // Disable priming events — the empty SSE data field they produce
+            // (`data: \n`) causes JSON parse errors in Python MCP clients that
+            // don't expect non-JSON SSE events.
+            sse_retry: None,
+            ..Default::default()
+        },
     );
 
     let app = Router::new()
