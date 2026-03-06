@@ -714,7 +714,23 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "parent_id": { "type": "string" },
                     "keep_done": { "type": "boolean" },
-                    "subtasks": { "type": "array" }
+                    "subtasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "description": { "type": "string" },
+                                "kind": { "type": "string" },
+                                "priority": { "type": "integer" },
+                                "deps_on": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            },
+                            "required": ["title"]
+                        }
+                    }
                 },
                 "required": ["parent_id", "subtasks"]
             }
@@ -726,7 +742,23 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "task_id": { "type": "string" },
-                    "parts": { "type": "array" }
+                    "parts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string" },
+                                "description": { "type": "string" },
+                                "done": { "type": "boolean" },
+                                "result": { "type": "string" },
+                                "deps_on": {
+                                    "type": "array",
+                                    "items": { "type": "string" }
+                                }
+                            },
+                            "required": ["title"]
+                        }
+                    }
                 },
                 "required": ["task_id", "parts"]
             }
