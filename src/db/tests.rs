@@ -1,6 +1,7 @@
 use crate::db::*;
 use crate::models::*;
 use chrono::{Duration, Utc};
+use serde_json::json;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -41,6 +42,11 @@ fn make_task(project_id: &str, title: &str, status: TaskStatus) -> Task {
         timeout_seconds: None,
         heartbeat_interval: 30,
         last_heartbeat: None,
+        sleep_id: None,
+        sleep_until: None,
+        sleep_state_ref: None,
+        sleep_reason: None,
+        wake_emitted_at: None,
         requires_approval: false,
         approval_status: None,
         approved_by: None,
@@ -175,6 +181,120 @@ fn sweeper_reclaims_retries_and_rolls_up_composites() {
     assert!(sweep.timed_out >= 1);
     assert!(sweep.retried >= 1);
     assert!(sweep.composites_completed >= 1);
+}
+
+#[test]
+fn parse_sleep_duration_accepts_ms_and_suffixes() {
+    assert_eq!(parse_sleep_duration_ms("3000").unwrap(), 3_000);
+    assert_eq!(parse_sleep_duration_ms("250ms").unwrap(), 250);
+    assert_eq!(parse_sleep_duration_ms("3s").unwrap(), 3_000);
+    assert_eq!(parse_sleep_duration_ms("2m").unwrap(), 120_000);
+    assert_eq!(parse_sleep_duration_ms("1h").unwrap(), 3_600_000);
+    assert!(parse_sleep_duration_ms("0s").is_err());
+    assert!(parse_sleep_duration_ms("abc").is_err());
+}
+
+#[test]
+fn sleep_resume_round_trip_returns_state_ref() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "SleepResume", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "download model", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let sleep = sleep_task(
+        &db,
+        &task.id,
+        3_000,
+        Some(json!({"checkpoint": "hf-download-1"})),
+        Some("waiting for download".to_string()),
+    )
+    .unwrap();
+    assert_eq!(sleep.task.status, TaskStatus::Sleeping);
+    assert_eq!(sleep.task.agent_id.as_deref(), Some("agent-a"));
+    assert_eq!(
+        sleep.state_ref,
+        Some(json!({"checkpoint": "hf-download-1"}))
+    );
+
+    let stale = resume_task(&db, &task.id, "agent-a", Some("s-stale")).unwrap_err();
+    assert!(stale.to_string().contains("sleep_id mismatch"));
+
+    let resumed = resume_task(&db, &task.id, "agent-a", Some(&sleep.sleep_id)).unwrap();
+    assert_eq!(resumed.task.status, TaskStatus::Running);
+    assert_eq!(resumed.task.agent_id.as_deref(), Some("agent-a"));
+    assert_eq!(resumed.sleep_id.as_deref(), Some(sleep.sleep_id.as_str()));
+    assert_eq!(
+        resumed.state_ref,
+        Some(json!({"checkpoint": "hf-download-1"}))
+    );
+
+    let fetched = get_task(&db, &task.id).unwrap();
+    assert!(fetched.sleep_id.is_none());
+    assert!(fetched.sleep_until.is_none());
+    assert!(fetched.sleep_state_ref.is_none());
+}
+
+#[test]
+fn due_wake_emission_is_idempotent_and_sleeping_is_not_reclaimed() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "DueWake", None, None, None).unwrap();
+
+    let task = create_task(&db, &make_task(&project.id, "wait", TaskStatus::Ready), &[]).unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+    let sleep = sleep_task(&db, &task.id, 60_000, Some(json!({"state": "x"})), None).unwrap();
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET sleep_until = ?2, last_heartbeat = ?3 WHERE id = ?1",
+            rusqlite::params![
+                &task.id,
+                crate::db::dt_to_sql(now() - Duration::seconds(1)),
+                crate::db::dt_to_sql(now() - Duration::seconds(600)),
+            ],
+        )
+        .unwrap();
+    }
+
+    let sweep = run_sweep(&db).unwrap();
+    assert_eq!(sweep.wakes_emitted, 1);
+    assert_eq!(sweep.reclaimed, 0);
+    let still_sleeping = get_task(&db, &task.id).unwrap();
+    assert_eq!(still_sleeping.status, TaskStatus::Sleeping);
+    assert_eq!(
+        still_sleeping.sleep_id.as_deref(),
+        Some(sleep.sleep_id.as_str())
+    );
+    assert!(still_sleeping.wake_emitted_at.is_some());
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].task_id, task.id);
+    assert_eq!(due[0].state_ref, Some(json!({"state": "x"})));
+
+    let second_sweep = run_sweep(&db).unwrap();
+    assert_eq!(second_sweep.wakes_emitted, 0);
+    let events = list_events(
+        &db,
+        EventFilters {
+            project_id: Some(project.id),
+            task_id: Some(task.id),
+            event_type: Some(EventType::TaskWakeDue),
+            since: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(events.len(), 1);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 pub mod routes;
 pub mod sse;
 
-use crate::db::{init_db, run_sweep, Database};
+use crate::db::{init_db, next_sleep_due_at, run_sweep, Database};
 use crate::mcp::handler::TaskgraphMcpHandler;
 use anyhow::Result;
 use axum::Router;
@@ -21,7 +21,15 @@ pub async fn run_server(db_path: &str, port: u16) -> Result<()> {
     tokio::spawn(async move {
         loop {
             let _ = run_sweep(&sweep_db);
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            let sleep_for = match next_sleep_due_at(&sweep_db) {
+                Ok(Some(next_due)) => {
+                    let now = chrono::Utc::now().naive_utc();
+                    let millis = (next_due - now).num_milliseconds().max(100) as u64;
+                    Duration::from_millis(millis.min(1_000))
+                }
+                _ => Duration::from_secs(1),
+            };
+            tokio::time::sleep(sleep_for).await;
         }
     });
 

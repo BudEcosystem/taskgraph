@@ -1,4 +1,4 @@
-use crate::db::tasks::promote_ready_tasks;
+use crate::db::tasks::{emit_due_wakes, promote_ready_tasks};
 use crate::db::{dt_to_sql, Database};
 use crate::models::{EventType, RetryBackoff};
 use anyhow::Result;
@@ -93,6 +93,7 @@ pub struct SweepResult {
     pub timed_out: usize,
     pub retried: usize,
     pub composites_completed: usize,
+    pub wakes_emitted: usize,
 }
 
 fn retry_delay_ms(base_delay: i64, backoff: RetryBackoff, retry_count: i32) -> i64 {
@@ -110,6 +111,8 @@ pub fn run_sweep(db: &Database) -> Result<SweepResult> {
     let now = chrono::Utc::now().naive_utc();
     let now_s = dt_to_sql(now);
     let mut result = SweepResult::default();
+
+    result.wakes_emitted = emit_due_wakes(db)?.len();
 
     {
         let conn = db.lock()?;

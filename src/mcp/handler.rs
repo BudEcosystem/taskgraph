@@ -46,10 +46,7 @@ impl ServerHandler for TaskgraphMcpHandler {
         let mut tool_list = Vec::with_capacity(schemas.len());
         for schema in schemas {
             let tool: Tool = serde_json::from_value(schema).map_err(|e| {
-                ErrorData::internal_error(
-                    format!("failed to convert tool schema: {e}"),
-                    None,
-                )
+                ErrorData::internal_error(format!("failed to convert tool schema: {e}"), None)
             })?;
             tool_list.push(tool);
         }
@@ -73,8 +70,7 @@ impl ServerHandler for TaskgraphMcpHandler {
 
         match tools::call_tool(&self.db, name, args) {
             Ok(value) => {
-                let text =
-                    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
                 Ok(CallToolResult::success(vec![Content::text(text)]))
             }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(e.to_string())])),

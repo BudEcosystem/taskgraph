@@ -2,8 +2,9 @@ use crate::db::dependencies::{add_dependency, remove_dependency};
 use crate::db::{
     dt_to_sql, json_to_sql, now_utc_naive, parse_dt, parse_json, Database, TaskgraphError,
 };
-use crate::models::{generate_id, RetryBackoff, Task, TaskKind, TaskStatus};
-use anyhow::Result;
+use crate::models::{generate_id, EventType, RetryBackoff, Task, TaskKind, TaskStatus};
+use anyhow::{anyhow, Result};
+use chrono::Duration;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,6 +17,7 @@ INSERT INTO tasks (
   result, error, progress, progress_note,
   max_retries, retry_count, retry_backoff, retry_delay_ms,
   timeout_seconds, heartbeat_interval, last_heartbeat,
+  sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at,
   requires_approval, approval_status, approved_by, approval_comment,
   metadata, created_at, updated_at
 ) VALUES (
@@ -25,8 +27,9 @@ INSERT INTO tasks (
   ?14, ?15, ?16, ?17,
   ?18, ?19, ?20, ?21,
   ?22, ?23, ?24,
-  ?25, ?26, ?27, ?28,
-  ?29, ?30, ?31
+  ?25, ?26, ?27, ?28, ?29,
+  ?30, ?31, ?32, ?33,
+  ?34, ?35, ?36
 );
 "#;
 
@@ -40,6 +43,7 @@ agent_id, claimed_at, started_at, completed_at,
 result, error, progress, progress_note,
 max_retries, retry_count, retry_backoff, retry_delay_ms,
 timeout_seconds, heartbeat_interval, last_heartbeat,
+sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at,
 requires_approval, approval_status, approved_by, approval_comment,
 metadata, created_at, updated_at
 FROM tasks
@@ -54,6 +58,7 @@ t.agent_id, t.claimed_at, t.started_at, t.completed_at,
 t.result, t.error, t.progress, t.progress_note,
 t.max_retries, t.retry_count, t.retry_backoff, t.retry_delay_ms,
 t.timeout_seconds, t.heartbeat_interval, t.last_heartbeat,
+t.sleep_id, t.sleep_until, t.sleep_state_ref, t.sleep_reason, t.wake_emitted_at,
 t.requires_approval, t.approval_status, t.approved_by, t.approval_comment,
 t.metadata, t.created_at, t.updated_at
 FROM tasks t
@@ -83,6 +88,7 @@ agent_id, claimed_at, started_at, completed_at,
 result, error, progress, progress_note,
 max_retries, retry_count, retry_backoff, retry_delay_ms,
 timeout_seconds, heartbeat_interval, last_heartbeat,
+sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at,
 requires_approval, approval_status, approved_by, approval_comment,
 metadata, created_at, updated_at;
 "#;
@@ -104,6 +110,7 @@ agent_id, claimed_at, started_at, completed_at,
 result, error, progress, progress_note,
 max_retries, retry_count, retry_backoff, retry_delay_ms,
 timeout_seconds, heartbeat_interval, last_heartbeat,
+sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at,
 requires_approval, approval_status, approved_by, approval_comment,
 metadata, created_at, updated_at;
 "#;
@@ -157,6 +164,36 @@ const UPDATE_PROGRESS: &str = r#"
 UPDATE tasks
 SET progress = ?2, progress_note = ?3, updated_at = ?4
 WHERE id = ?1;
+"#;
+
+const SLEEP_TASK: &str = r#"
+UPDATE tasks
+SET status = 'sleeping',
+    sleep_id = ?2,
+    sleep_until = ?3,
+    sleep_state_ref = ?4,
+    sleep_reason = ?5,
+    wake_emitted_at = NULL,
+    last_heartbeat = NULL,
+    updated_at = ?6
+WHERE id = ?1 AND status IN ('claimed', 'running');
+"#;
+
+const RESUME_TASK: &str = r#"
+UPDATE tasks
+SET status = 'running',
+    started_at = COALESCE(started_at, ?4),
+    last_heartbeat = ?4,
+    sleep_id = NULL,
+    sleep_until = NULL,
+    sleep_state_ref = NULL,
+    sleep_reason = NULL,
+    wake_emitted_at = NULL,
+    updated_at = ?4
+WHERE id = ?1
+  AND status = 'sleeping'
+  AND agent_id = ?2
+  AND (?3 IS NULL OR sleep_id = ?3);
 "#;
 
 const APPROVE_TASK: &str = r#"
@@ -250,7 +287,36 @@ pub struct ProjectState {
     pub done: usize,
     pub ready: usize,
     pub running: usize,
+    pub sleeping: usize,
     pub pending: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DueWake {
+    pub task_id: String,
+    pub project_id: String,
+    pub agent_id: Option<String>,
+    pub sleep_id: String,
+    pub wake_at: chrono::NaiveDateTime,
+    pub state_ref: Option<Value>,
+    pub reason: Option<String>,
+    pub wake_emitted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SleepResult {
+    pub task: Task,
+    pub sleep_id: String,
+    pub wake_at: chrono::NaiveDateTime,
+    pub state_ref: Option<Value>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResumeResult {
+    pub task: Task,
+    pub sleep_id: Option<String>,
+    pub state_ref: Option<Value>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -318,7 +384,10 @@ pub(crate) fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let completed_at: Option<String> = row.get(12)?;
     let result: Option<String> = row.get(13)?;
     let last_heartbeat: Option<String> = row.get(23)?;
-    let metadata: Option<String> = row.get(28)?;
+    let sleep_until: Option<String> = row.get(25)?;
+    let sleep_state_ref: Option<String> = row.get(26)?;
+    let wake_emitted_at: Option<String> = row.get(28)?;
+    let metadata: Option<String> = row.get(33)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -356,13 +425,24 @@ pub(crate) fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
             .map(parse_dt)
             .transpose()
             .map_err(|e| conv(23, e))?,
-        requires_approval: row.get(24)?,
-        approval_status: row.get(25)?,
-        approved_by: row.get(26)?,
-        approval_comment: row.get(27)?,
-        metadata: parse_json(metadata).map_err(|e| conv(28, e))?,
-        created_at: parse_dt(row.get::<_, String>(29)?).map_err(|e| conv(29, e))?,
-        updated_at: parse_dt(row.get::<_, String>(30)?).map_err(|e| conv(30, e))?,
+        sleep_id: row.get(24)?,
+        sleep_until: sleep_until
+            .map(parse_dt)
+            .transpose()
+            .map_err(|e| conv(25, e))?,
+        sleep_state_ref: parse_json(sleep_state_ref).map_err(|e| conv(26, e))?,
+        sleep_reason: row.get(27)?,
+        wake_emitted_at: wake_emitted_at
+            .map(parse_dt)
+            .transpose()
+            .map_err(|e| conv(28, e))?,
+        requires_approval: row.get(29)?,
+        approval_status: row.get(30)?,
+        approved_by: row.get(31)?,
+        approval_comment: row.get(32)?,
+        metadata: parse_json(metadata).map_err(|e| conv(33, e))?,
+        created_at: parse_dt(row.get::<_, String>(34)?).map_err(|e| conv(34, e))?,
+        updated_at: parse_dt(row.get::<_, String>(35)?).map_err(|e| conv(35, e))?,
     })
 }
 
@@ -383,6 +463,7 @@ pub fn create_task(db: &Database, task: &Task, tags: &[String]) -> Result<Task> 
     }
     let task_id = task_with_defaults.id.clone();
     let result = json_to_sql(&task_with_defaults.result)?;
+    let sleep_state_ref = json_to_sql(&task_with_defaults.sleep_state_ref)?;
     let metadata = json_to_sql(&task_with_defaults.metadata)?;
     conn.execute(
         INSERT_TASK,
@@ -411,6 +492,11 @@ pub fn create_task(db: &Database, task: &Task, tags: &[String]) -> Result<Task> 
             task_with_defaults.timeout_seconds,
             task_with_defaults.heartbeat_interval,
             task_with_defaults.last_heartbeat.map(dt_to_sql),
+            &task_with_defaults.sleep_id,
+            task_with_defaults.sleep_until.map(dt_to_sql),
+            &sleep_state_ref,
+            &task_with_defaults.sleep_reason,
+            task_with_defaults.wake_emitted_at.map(dt_to_sql),
             task_with_defaults.requires_approval,
             &task_with_defaults.approval_status,
             &task_with_defaults.approved_by,
@@ -704,6 +790,304 @@ pub fn update_progress(
     Ok(conn.execute(UPDATE_PROGRESS, params![task_id, progress, note, now])?)
 }
 
+pub fn parse_sleep_duration_ms(input: &str) -> Result<i64> {
+    let raw = input.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return Err(anyhow!("duration cannot be empty"));
+    }
+    if raw.chars().all(|c| c.is_ascii_digit()) {
+        let value = raw.parse::<i64>()?;
+        if value <= 0 {
+            return Err(anyhow!("duration must be positive"));
+        }
+        return Ok(value);
+    }
+
+    let (number, multiplier) = if let Some(rest) = raw.strip_suffix("ms") {
+        (rest, 1_i64)
+    } else if let Some(rest) = raw.strip_suffix('s') {
+        (rest, 1_000_i64)
+    } else if let Some(rest) = raw.strip_suffix('m') {
+        (rest, 60_000_i64)
+    } else if let Some(rest) = raw.strip_suffix('h') {
+        (rest, 3_600_000_i64)
+    } else {
+        return Err(anyhow!(
+            "invalid duration '{input}'. Use milliseconds or a suffix: ms, s, m, h"
+        ));
+    };
+
+    let value = number
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| anyhow!("invalid duration number: {number}"))?;
+    if value <= 0 {
+        return Err(anyhow!("duration must be positive"));
+    }
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("duration is too large"))
+}
+
+pub fn sleep_task(
+    db: &Database,
+    task_id: &str,
+    duration_ms: i64,
+    state_ref: Option<Value>,
+    reason: Option<String>,
+) -> Result<SleepResult> {
+    if duration_ms <= 0 {
+        return Err(anyhow!("duration must be positive"));
+    }
+    let current = get_task(db, task_id)?;
+    if !matches!(current.status, TaskStatus::Claimed | TaskStatus::Running) {
+        return Err(TaskgraphError::InvalidTransition(format!(
+            "task {task_id} must be claimed or running to sleep"
+        ))
+        .into());
+    }
+    if current.agent_id.is_none() {
+        return Err(TaskgraphError::InvalidTransition(format!(
+            "task {task_id} must be claimed by an agent to sleep"
+        ))
+        .into());
+    }
+
+    let sleep_id = generate_id("sleep");
+    let now = now_utc_naive();
+    let wake_at = now + Duration::milliseconds(duration_ms);
+    let state_ref_sql = json_to_sql(&state_ref)?;
+    let conn = db.lock()?;
+    let changed = conn.execute(
+        SLEEP_TASK,
+        params![
+            task_id,
+            &sleep_id,
+            dt_to_sql(wake_at),
+            state_ref_sql,
+            reason,
+            dt_to_sql(now)
+        ],
+    )?;
+    if changed == 0 {
+        return Err(TaskgraphError::InvalidTransition(format!(
+            "task {task_id} must be claimed or running to sleep"
+        ))
+        .into());
+    }
+    drop(conn);
+
+    let task = get_task(db, task_id)?;
+    let _ = crate::db::insert_event(
+        db,
+        Some(&task.id),
+        Some(&task.project_id),
+        task.agent_id.as_deref(),
+        EventType::TaskSleeping,
+        Some(serde_json::json!({
+            "sleep_id": sleep_id,
+            "wake_at": wake_at,
+            "state_ref": state_ref,
+            "reason": task.sleep_reason,
+        })),
+        now,
+    );
+
+    Ok(SleepResult {
+        task,
+        sleep_id,
+        wake_at,
+        state_ref,
+    })
+}
+
+pub fn resume_task(
+    db: &Database,
+    task_id: &str,
+    agent_id: &str,
+    sleep_id: Option<&str>,
+) -> Result<ResumeResult> {
+    let current = get_task(db, task_id)?;
+    let state_ref = current.sleep_state_ref.clone();
+    let previous_sleep_id = current.sleep_id.clone();
+    let reason = current.sleep_reason.clone();
+    if !matches!(current.status, TaskStatus::Sleeping) {
+        return Err(TaskgraphError::InvalidTransition(format!(
+            "task {task_id} must be sleeping to resume"
+        ))
+        .into());
+    }
+    if current.agent_id.as_deref() != Some(agent_id) {
+        return Err(TaskgraphError::Conflict(format!(
+            "task {task_id} is sleeping for agent {}",
+            current.agent_id.unwrap_or_else(|| "<none>".to_string())
+        ))
+        .into());
+    }
+    if let Some(expected) = sleep_id {
+        if current.sleep_id.as_deref() != Some(expected) {
+            return Err(
+                TaskgraphError::Conflict(format!("sleep_id mismatch for task {task_id}")).into(),
+            );
+        }
+    }
+
+    let conn = db.lock()?;
+    let now = now_utc_naive();
+    let changed = conn.execute(
+        RESUME_TASK,
+        params![task_id, agent_id, sleep_id, dt_to_sql(now)],
+    )?;
+    if changed == 0 {
+        return Err(TaskgraphError::InvalidTransition(format!(
+            "task {task_id} could not be resumed"
+        ))
+        .into());
+    }
+    drop(conn);
+    let task = get_task(db, task_id)?;
+    let _ = crate::db::insert_event(
+        db,
+        Some(&task.id),
+        Some(&task.project_id),
+        Some(agent_id),
+        EventType::TaskResumed,
+        Some(serde_json::json!({
+            "sleep_id": previous_sleep_id,
+        })),
+        now,
+    );
+
+    Ok(ResumeResult {
+        task,
+        sleep_id: previous_sleep_id,
+        state_ref,
+        reason,
+    })
+}
+
+pub fn list_due_wakes(db: &Database, project_id: Option<&str>) -> Result<Vec<DueWake>> {
+    let conn = db.lock()?;
+    let now = dt_to_sql(now_utc_naive());
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, project_id, agent_id, sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at
+        FROM tasks
+        WHERE status = 'sleeping'
+          AND sleep_until IS NOT NULL
+          AND sleep_until <= ?1
+          AND (?2 IS NULL OR project_id = ?2)
+        ORDER BY sleep_until ASC, id ASC
+        "#,
+    )?;
+    let mut rows = stmt.query(params![now, project_id])?;
+    let mut wakes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let sleep_id: Option<String> = row.get(3)?;
+        let sleep_until: String = row.get(4)?;
+        let state_ref: Option<String> = row.get(5)?;
+        let wake_emitted_at: Option<String> = row.get(7)?;
+        wakes.push(DueWake {
+            task_id: row.get(0)?,
+            project_id: row.get(1)?,
+            agent_id: row.get(2)?,
+            sleep_id: sleep_id.unwrap_or_default(),
+            wake_at: parse_dt(sleep_until)?,
+            state_ref: parse_json(state_ref)?,
+            reason: row.get(6)?,
+            wake_emitted_at: wake_emitted_at.map(parse_dt).transpose()?,
+        });
+    }
+    Ok(wakes)
+}
+
+pub fn next_sleep_due_at(db: &Database) -> Result<Option<chrono::NaiveDateTime>> {
+    let conn = db.lock()?;
+    let raw: Option<String> = conn.query_row(
+        r#"
+        SELECT MIN(sleep_until)
+        FROM tasks
+        WHERE status = 'sleeping'
+          AND sleep_until IS NOT NULL
+          AND wake_emitted_at IS NULL
+        "#,
+        [],
+        |row| row.get(0),
+    )?;
+    raw.map(parse_dt).transpose()
+}
+
+pub fn emit_due_wakes(db: &Database) -> Result<Vec<DueWake>> {
+    let now = now_utc_naive();
+    let now_s = dt_to_sql(now);
+    let mut conn = db.lock()?;
+    let tx = conn.transaction()?;
+    let mut stmt = tx.prepare(
+        r#"
+        SELECT id, project_id, agent_id, sleep_id, sleep_until, sleep_state_ref, sleep_reason
+        FROM tasks
+        WHERE status = 'sleeping'
+          AND sleep_until IS NOT NULL
+          AND sleep_until <= ?1
+          AND wake_emitted_at IS NULL
+        ORDER BY sleep_until ASC, id ASC
+        "#,
+    )?;
+    let mut rows = stmt.query(params![now_s.clone()])?;
+    let mut wakes = Vec::new();
+    while let Some(row) = rows.next()? {
+        let state_ref_raw: Option<String> = row.get(5)?;
+        let sleep_until: String = row.get(4)?;
+        let state_ref = parse_json(state_ref_raw)?;
+        wakes.push(DueWake {
+            task_id: row.get(0)?,
+            project_id: row.get(1)?,
+            agent_id: row.get(2)?,
+            sleep_id: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            wake_at: parse_dt(sleep_until)?,
+            state_ref,
+            reason: row.get(6)?,
+            wake_emitted_at: Some(now),
+        });
+    }
+    drop(rows);
+    drop(stmt);
+
+    let mut emitted = Vec::new();
+    for wake in wakes {
+        let changed = tx.execute(
+            "UPDATE tasks SET wake_emitted_at = ?2, updated_at = ?2 WHERE id = ?1 AND wake_emitted_at IS NULL",
+            params![&wake.task_id, now_s.clone()],
+        )?;
+        if changed == 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO events(task_id, project_id, agent_id, event_type, payload, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &wake.task_id,
+                &wake.project_id,
+                wake.agent_id.as_deref(),
+                EventType::TaskWakeDue,
+                serde_json::to_string(&serde_json::json!({
+                    "task_id": &wake.task_id,
+                    "project_id": &wake.project_id,
+                    "agent_id": &wake.agent_id,
+                    "sleep_id": &wake.sleep_id,
+                    "wake_at": wake.wake_at,
+                    "state_ref": &wake.state_ref,
+                    "reason": &wake.reason,
+                }))?,
+                now_s.clone()
+            ],
+        )?;
+        emitted.push(wake);
+    }
+
+    tx.commit()?;
+    Ok(emitted)
+}
+
 pub fn approve_task(
     db: &Database,
     task_id: &str,
@@ -847,6 +1231,7 @@ pub fn batch_create_tasks(db: &Database, tasks: &[Task]) -> Result<usize> {
     let mut inserted = 0usize;
     for task in tasks {
         let result = json_to_sql(&task.result)?;
+        let sleep_state_ref = json_to_sql(&task.sleep_state_ref)?;
         let metadata = json_to_sql(&task.metadata)?;
         tx.execute(
             INSERT_TASK,
@@ -875,6 +1260,11 @@ pub fn batch_create_tasks(db: &Database, tasks: &[Task]) -> Result<usize> {
                 task.timeout_seconds,
                 task.heartbeat_interval,
                 task.last_heartbeat.map(dt_to_sql),
+                &task.sleep_id,
+                task.sleep_until.map(dt_to_sql),
+                &sleep_state_ref,
+                &task.sleep_reason,
+                task.wake_emitted_at.map(dt_to_sql),
                 task.requires_approval,
                 &task.approval_status,
                 &task.approved_by,
@@ -926,6 +1316,10 @@ pub fn project_state(db: &Database, project_id: &str) -> Result<ProjectState> {
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
         .count();
+    let sleeping = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Sleeping)
+        .count();
     let pending = tasks
         .iter()
         .filter(|t| t.status == TaskStatus::Pending)
@@ -935,6 +1329,7 @@ pub fn project_state(db: &Database, project_id: &str) -> Result<ProjectState> {
         done,
         ready,
         running,
+        sleeping,
         pending,
     })
 }
@@ -949,9 +1344,10 @@ pub fn insert_task_between(
 ) -> Result<Task> {
     let after = get_task(db, after_task)?;
     if after.project_id != project_id {
-        return Err(
-            TaskgraphError::Conflict("after task belongs to a different project".to_string()).into(),
-        );
+        return Err(TaskgraphError::Conflict(
+            "after task belongs to a different project".to_string(),
+        )
+        .into());
     }
 
     if let Some(before_task_id) = before_task {
@@ -990,6 +1386,11 @@ pub fn insert_task_between(
         timeout_seconds: None,
         heartbeat_interval: 30,
         last_heartbeat: None,
+        sleep_id: None,
+        sleep_until: None,
+        sleep_state_ref: None,
+        sleep_reason: None,
+        wake_emitted_at: None,
         requires_approval: false,
         approval_status: None,
         approved_by: None,
@@ -1102,7 +1503,12 @@ pub fn get_lookahead(db: &Database, project_id: &str, depth: usize) -> Result<Lo
     }
     let mut current: Vec<Task> = task_by_id
         .values()
-        .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Claimed))
+        .filter(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Running | TaskStatus::Claimed | TaskStatus::Sleeping
+            )
+        })
         .cloned()
         .collect();
     current.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1199,10 +1605,11 @@ pub fn pivot_subtree(
 
     if children
         .iter()
-        .any(|child| matches!(child.status, TaskStatus::Running))
+        .any(|child| matches!(child.status, TaskStatus::Running | TaskStatus::Sleeping))
     {
         return Err(TaskgraphError::InvalidTransition(
-            "cannot pivot while a child is running; pause or complete it first".to_string(),
+            "cannot pivot while a child is running or sleeping; pause/resume or complete it first"
+                .to_string(),
         )
         .into());
     }
@@ -1276,6 +1683,11 @@ pub fn pivot_subtree(
             timeout_seconds: None,
             heartbeat_interval: 30,
             last_heartbeat: None,
+            sleep_id: None,
+            sleep_until: None,
+            sleep_state_ref: None,
+            sleep_reason: None,
+            wake_emitted_at: None,
             requires_approval: false,
             approval_status: None,
             approved_by: None,
@@ -1380,6 +1792,11 @@ pub fn split_task(db: &Database, task_id: &str, parts: Vec<SplitPart>) -> Result
             timeout_seconds: None,
             heartbeat_interval: 30,
             last_heartbeat: None,
+            sleep_id: None,
+            sleep_until: None,
+            sleep_state_ref: None,
+            sleep_reason: None,
+            wake_emitted_at: None,
             requires_approval: false,
             approval_status: None,
             approved_by: None,

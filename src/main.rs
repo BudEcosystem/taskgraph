@@ -117,8 +117,10 @@ prerequisites are complete.
 1. Create a project: `taskgraph_project_create` with a name
 2. Add tasks with dependencies — each task declares which tasks must finish first
 3. Claim work: `taskgraph_go` returns the next ready task with handoff context from completed upstream tasks
-4. Complete + advance: `taskgraph_done` marks complete, `taskgraph_go` gets the next one
-5. Check progress: `taskgraph_status` shows done/total/ready/running counts
+4. Sleep when waiting: `taskgraph_task_sleep` stores a resume state ref and releases the agent until a wake time
+5. Resume when due: `taskgraph_wakes_due` or `task_wake_due` identifies due sleeps, then `taskgraph_task_resume` returns the saved state ref
+6. Complete + advance: `taskgraph_done` marks complete, `taskgraph_go` gets the next one
+7. Check progress: `taskgraph_status` shows done/total/ready/running/sleeping counts
 
 ### Plan Adaptation (mid-flight)
 - `taskgraph_task_insert` — add a missed step between existing tasks
@@ -127,9 +129,10 @@ prerequisites are complete.
 - `taskgraph_ahead` — see what tasks are coming next
 
 ### Key Concepts
-- Tasks flow: pending → ready (when deps done) → claimed → running → done/failed
+- Tasks flow: pending → ready (when deps done) → claimed → running/sleeping → done/failed
 - Dependency types: `feeds_into` (default), `blocks`, `suggests`
 - Task kinds: `generic`, `code`, `research`, `review`, `test`, `shell`
+- Durable sleep: agents can sleep owned work with an opaque `state_ref`; taskgraph keeps the current `agent_id` and emits `task_wake_due`
 - IDs are short 8-char strings (e.g. `t-a1b2c3d4`)
 - Fuzzy matching: misspell a task ID and taskgraph suggests the closest match
 - Use `--compact` flag on tools for token-efficient output"#
@@ -191,6 +194,19 @@ taskgraph done t-TASKID --result '{{\"summary\": \"implemented auth\"}}' --next 
 # --files "src/auth.rs,src/middleware.rs" enables conflict detection
 ```
 
+### Durable Sleep / Wake
+```bash
+# Use when the agent owns a task but is only waiting on time/external work.
+# Bare duration numbers are milliseconds; suffixes support ms/s/m/h.
+taskgraph sleep t-TASKID 3000 --state-ref '{{"checkpoint":"hf-download-42"}}' --reason "waiting for model download"
+
+# A server emits task_wake_due near the wake time. Without a server, poll:
+taskgraph wakes due
+
+# Restart the same logical agent and resume. Pass --sleep-id to reject stale resumes.
+taskgraph resume t-TASKID --agent my-agent --sleep-id sleep-a1b2c3d4
+```
+
 ### Checking Status
 ```bash
 taskgraph status                   # One-line: "5/12 done (42%) | ready: t-xx,t-yy | running: t-zz@agent-1"
@@ -238,7 +254,7 @@ taskgraph task notes t-abc123
 ```
 
 ### Key Concepts
-- **Task states**: pending → ready (when deps complete) → claimed → running → done/failed
+- **Task states**: pending → ready (when deps complete) → claimed → running/sleeping → done/failed
 - **Dependency types**: `feeds_into` (default, result passed downstream), `blocks` (ordering only), `suggests` (soft)
 - **Task kinds**: `generic`, `code`, `research`, `review`, `test`, `shell`
 - **IDs**: short 8-char strings like `t-a1b2c3d4` — every token matters
@@ -246,13 +262,14 @@ taskgraph task notes t-abc123
 - **Default project**: `taskgraph use <id>` sets default, no --project needed per command
 - **Output modes**: human default, `--json` for structured, `-c`/`--compact` for token-efficient
 - **Handoff protocol**: when you complete a task with --result, that data is available to the agent working on downstream tasks via `taskgraph go`
+- **Sleep protocol**: when waiting, `taskgraph sleep` stores an opaque state reference and keeps the current `agent_id`; `taskgraph resume` returns that state to the same logical agent
 - **Effect analysis**: insert/pivot/split responses include which tasks got delayed/accelerated/unblocked
 
 ### Multi-Agent Pattern
 When `taskgraph status` shows multiple ready tasks, a harness can spawn parallel agents:
 ```
-Agent 1: taskgraph go --agent agent-1 → work → taskgraph done ID --next --agent agent-1
-Agent 2: taskgraph go --agent agent-2 → work → taskgraph done ID --next --agent agent-2
+Agent 1: taskgraph go --agent agent-1 → work/sleep → taskgraph done ID --next --agent agent-1
+Agent 2: taskgraph go --agent agent-2 → work/sleep → taskgraph done ID --next --agent agent-2
 ```
 Atomic claim protocol prevents two agents from claiming the same task."#
     );
@@ -262,13 +279,13 @@ fn print_prompt_http() {
     println!(
         r#"# ─── HTTP Mode Setup ──────────────────────────────────────────
 # Start the server first:
-#   taskgraph serve --port 8080
+#   taskgraph serve --port 8484
 #
 # ─── Paste into system prompt or agent config ───
 
 ## Taskgraph — Task Graph REST API
 
-You have a task graph API at http://localhost:8080 for managing dependencies between tasks.
+You have a task graph API at http://localhost:8484/api for managing dependencies between tasks.
 Use it to decompose complex work, enforce ordering, and coordinate multiple agents.
 
 ### API Reference
@@ -277,16 +294,21 @@ PROJECT MANAGEMENT:
   POST   /projects                   Create project. Body: {{"name": "...", "description": "..."}}
   GET    /projects                   List all projects
   GET    /projects/:id               Get project details
+  GET    /projects/:id/status        Project progress summary
+  GET    /projects/:id/overview      Summary, ready IDs, tasks, and edges
 
 TASK MANAGEMENT:
-  POST   /tasks                      Create task. Body: {{"project_id": "...", "title": "...", "deps": ["t-xxx"], "kind": "code"}}
-  GET    /tasks?project_id=X         List tasks (filter: status, kind, agent, tag)
+  POST   /projects/:project_id/tasks Create task. Body: {{"title": "...", "deps": ["t-xxx"], "kind": "code"}}
+  GET    /projects/:project_id/tasks List tasks (filter: status, kind, agent, tag)
   GET    /tasks/:id                  Get task details
   PATCH  /tasks/:id                  Update task fields
 
 WORK LOOP:
   POST   /go                         Claim + start next ready task. Body: {{"project_id": "...", "agent_id": "..."}}
                                      Returns: task, handoff context, file conflicts, remaining counts
+  POST   /tasks/:id/sleep            Durable sleep. Body: {{"duration": "3000", "state_ref": {{"checkpoint": "..."}}, "reason": "..."}}
+  GET    /wakes/due?project=X        List sleeping tasks whose wake time has arrived
+  POST   /tasks/:id/resume           Resume sleeping task. Body: {{"agent_id": "...", "sleep_id": "..."}}
   POST   /tasks/:id/done             Complete task. Body: {{"result": ..., "files": ["src/x.rs"]}}
   POST   /tasks/:id/fail             Fail task. Body: {{"error": "..."}}
   POST   /tasks/:id/claim            Claim specific task. Body: {{"agent_id": "..."}}
@@ -297,24 +319,27 @@ WORK LOOP:
 PLAN ADAPTATION:
   POST   /tasks/insert               Insert between tasks. Body: {{"after": "t-a", "before": "t-b", "title": "...", "project_id": "..."}}
   POST   /tasks/:id/amend            Prepend context. Body: {{"prepend": "NOTE: use JWT"}}
-  POST   /what-if/cancel/:id         Preview cancel effects (read-only)
-  GET    /ahead?project_id=X&depth=2 Lookahead buffer
+  POST   /tasks/:id/pivot            Replace a subtree
+  POST   /tasks/:id/split            Split a task
+  POST   /what-if                    Preview mutation effects (read-only)
+  GET    /ahead?project=X&depth=2    Lookahead buffer
 
 STATUS:
-  GET    /status?project_id=X        Project progress summary
   GET    /tasks/:id/notes            List notes on task
   POST   /tasks/:id/notes            Add note. Body: {{"content": "...", "agent_id": "..."}}
 
 EVENTS (real-time):
-  GET    /events?project_id=X        SSE stream of task state changes
+  GET    /events/stream?project_id=X SSE stream of task state changes
 
 ### Key Concepts
-- Task states: pending → ready (deps done) → claimed → running → done/failed
+- Task states: pending → ready (deps done) → claimed → running/sleeping → done/failed
 - Dependency types: `feeds_into` (default), `blocks`, `suggests`
 - Task kinds: `generic`, `code`, `research`, `review`, `test`, `shell`
 - IDs are short 8-char strings (e.g. `t-a1b2c3d4`)
 - Add `?compact=true` to any GET for token-efficient responses
 - POST /go is the preferred agent entry point — returns task + upstream context
+- POST /tasks/:id/sleep stores an opaque state_ref and keeps the current agent_id
+- task_wake_due events and /wakes/due tell a harness when to restart/resume the same logical agent
 - POST /tasks/:id/done with result data enables handoff to downstream tasks"#
     );
 }

@@ -9,9 +9,10 @@ use crate::db::{
     claim_next_task, claim_task, complete_task, compute_effects, create_artifact, create_project,
     create_task, fail_task, get_artifact, get_downstream_tasks, get_handoff_context, get_lookahead,
     get_project, get_task, get_upstream_artifacts, insert_task_between, list_artifacts,
-    list_dependencies, list_notes, list_tasks, pause_task, pivot_subtree, project_state,
-    promote_ready_tasks, remove_dependency, run_sweep, snapshot_task_statuses, split_task,
-    start_task, update_task, Database, NewSubtask, SplitPart, TaskListFilters,
+    list_dependencies, list_due_wakes, list_notes, list_tasks, parse_sleep_duration_ms, pause_task,
+    pivot_subtree, project_state, promote_ready_tasks, remove_dependency, resume_task, run_sweep,
+    sleep_task, snapshot_task_statuses, split_task, start_task, update_task, Database, NewSubtask,
+    SplitPart, TaskListFilters,
 };
 use crate::models::{
     generate_id, Artifact, DependencyCondition, DependencyKind, RetryBackoff, Task, TaskKind,
@@ -137,6 +138,26 @@ struct TaskPauseArgs {
     task_id: String,
     progress: Option<i32>,
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskSleepArgs {
+    task_id: String,
+    duration: String,
+    state_ref: Option<Value>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskResumeArgs {
+    task_id: String,
+    agent_id: String,
+    sleep_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DueWakesArgs {
+    project_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +646,43 @@ pub fn tool_schemas() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "taskgraph_task_sleep",
+            "description": "Put a claimed/running task into durable sleep until a wake time",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "duration": { "type": "string", "description": "3000 (ms), 3s, 5m, 1h" },
+                    "state_ref": { "type": "object" },
+                    "reason": { "type": "string" }
+                },
+                "required": ["task_id", "duration"]
+            }
+        }),
+        json!({
+            "name": "taskgraph_task_resume",
+            "description": "Resume a sleeping task for the same logical agent",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "agent_id": { "type": "string" },
+                    "sleep_id": { "type": "string" }
+                },
+                "required": ["task_id", "agent_id"]
+            }
+        }),
+        json!({
+            "name": "taskgraph_wakes_due",
+            "description": "List sleeping tasks whose wake time has arrived",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" }
+                }
+            }
+        }),
+        json!({
             "name": "taskgraph_task_replan",
             "description": "Cancel remaining subtasks and create replacement subtasks",
             "inputSchema": {
@@ -797,6 +855,9 @@ pub fn call_tool(db: &Database, tool_name: &str, args: Value) -> ToolHandlerResu
         "taskgraph_task_notes" => taskgraph_task_notes(db, args),
         "taskgraph_status" => taskgraph_status(db, args),
         "taskgraph_task_pause" => taskgraph_task_pause(db, args),
+        "taskgraph_task_sleep" => taskgraph_task_sleep(db, args),
+        "taskgraph_task_resume" => taskgraph_task_resume(db, args),
+        "taskgraph_wakes_due" => taskgraph_wakes_due(db, args),
         "taskgraph_task_replan" => taskgraph_task_replan(db, args),
         "taskgraph_what_if" => taskgraph_what_if(db, args),
         "taskgraph_task_insert" => taskgraph_task_insert(db, args),
@@ -890,6 +951,11 @@ fn make_task(project_id: &str, title: &str, description: Option<String>) -> Task
         timeout_seconds: None,
         heartbeat_interval: 30,
         last_heartbeat: None,
+        sleep_id: None,
+        sleep_until: None,
+        sleep_state_ref: None,
+        sleep_reason: None,
+        wake_emitted_at: None,
         requires_approval: false,
         approval_status: None,
         approved_by: None,
@@ -1105,6 +1171,10 @@ fn go_response(db: &Database, project_id: Option<String>, agent_id: String) -> T
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
         .count();
+    let sleeping = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Sleeping)
+        .count();
     let pending = tasks
         .iter()
         .filter(|t| t.status == TaskStatus::Pending)
@@ -1161,6 +1231,7 @@ fn go_response(db: &Database, project_id: Option<String>, agent_id: String) -> T
             "done": done,
             "ready": ready,
             "running": running,
+            "sleeping": sleeping,
             "pending": pending,
         },
         "progress": progress,
@@ -1275,6 +1346,7 @@ fn taskgraph_project_status(db: &Database, args: Value) -> ToolHandlerResult {
     let mut pending = 0usize;
     let mut ready = 0usize;
     let mut running = 0usize;
+    let mut sleeping = 0usize;
     let mut done = 0usize;
     let mut failed = 0usize;
 
@@ -1283,6 +1355,7 @@ fn taskgraph_project_status(db: &Database, args: Value) -> ToolHandlerResult {
             TaskStatus::Pending => pending += 1,
             TaskStatus::Ready => ready += 1,
             TaskStatus::Running => running += 1,
+            TaskStatus::Sleeping => sleeping += 1,
             TaskStatus::Done | TaskStatus::DonePartial => done += 1,
             TaskStatus::Failed => failed += 1,
             _ => {}
@@ -1302,6 +1375,7 @@ fn taskgraph_project_status(db: &Database, args: Value) -> ToolHandlerResult {
             "pending": pending,
             "ready": ready,
             "running": running,
+            "sleeping": sleeping,
             "done": done,
             "failed": failed,
         },
@@ -1482,6 +1556,7 @@ fn taskgraph_project_overview(db: &Database, args: Value) -> ToolHandlerResult {
     let mut ready = 0usize;
     let mut claimed = 0usize;
     let mut running = 0usize;
+    let mut sleeping = 0usize;
     let mut done = 0usize;
     let mut failed = 0usize;
     let mut cancelled = 0usize;
@@ -1498,6 +1573,7 @@ fn taskgraph_project_overview(db: &Database, args: Value) -> ToolHandlerResult {
                 }
                 TaskStatus::Claimed => claimed += 1,
                 TaskStatus::Running => running += 1,
+                TaskStatus::Sleeping => sleeping += 1,
                 TaskStatus::Done | TaskStatus::DonePartial => done += 1,
                 TaskStatus::Failed => failed += 1,
                 TaskStatus::Cancelled => cancelled += 1,
@@ -1526,6 +1602,7 @@ fn taskgraph_project_overview(db: &Database, args: Value) -> ToolHandlerResult {
             "ready": ready,
             "claimed": claimed,
             "running": running,
+            "sleeping": sleeping,
             "done": done,
             "failed": failed,
             "cancelled": cancelled,
@@ -1638,6 +1715,25 @@ fn taskgraph_task_pause(db: &Database, args: Value) -> ToolHandlerResult {
     let args: TaskPauseArgs = serde_json::from_value(args)?;
     let task = pause_task(db, &args.task_id, args.progress, args.note)?;
     Ok(serde_json::to_value(task)?)
+}
+
+fn taskgraph_task_sleep(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: TaskSleepArgs = serde_json::from_value(args)?;
+    let duration_ms = parse_sleep_duration_ms(&args.duration)?;
+    let result = sleep_task(db, &args.task_id, duration_ms, args.state_ref, args.reason)?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn taskgraph_task_resume(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: TaskResumeArgs = serde_json::from_value(args)?;
+    let result = resume_task(db, &args.task_id, &args.agent_id, args.sleep_id.as_deref())?;
+    Ok(serde_json::to_value(result)?)
+}
+
+fn taskgraph_wakes_due(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: DueWakesArgs = serde_json::from_value(args)?;
+    let wakes = list_due_wakes(db, args.project_id.as_deref())?;
+    Ok(serde_json::to_value(wakes)?)
 }
 
 fn taskgraph_what_if(db: &Database, args: Value) -> ToolHandlerResult {

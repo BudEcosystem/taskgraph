@@ -11,12 +11,14 @@ one file: `.taskgraph.db`.
 
 taskgraph turns a plan into a directed graph of tasks:
 
-- tasks have states such as `pending`, `ready`, `claimed`, `running`, `done`,
-  `failed`, and `cancelled`;
+- tasks have states such as `pending`, `ready`, `claimed`, `running`,
+  `sleeping`, `done`, `failed`, and `cancelled`;
 - dependencies decide when downstream work becomes ready;
 - agents atomically claim ready work so two agents do not pick the same task;
 - completed task results are stored as JSON and included as handoff context for
   downstream tasks;
+- agents can put owned work into durable sleep, exit to save resources, and
+  resume later with an opaque state reference;
 - notes, artifacts, events, progress, files, retries, timeouts, and approvals are
   tracked beside the task graph;
 - plans can be changed while work is in progress with insert, amend, split,
@@ -34,14 +36,17 @@ Use taskgraph when you have:
 - several agents or scripts that need to coordinate without stepping on each
   other;
 - a plan that may change after new information appears;
+- agents that wait on external work, downloads, training runs, rate limits, or
+  other time-based gaps and should not stay alive just to poll;
 - a local-first workflow where a single binary and SQLite file are preferable to
   Redis, a queue, or a workflow server;
 - an MCP-compatible editor or agent that needs tools for planning and execution.
 
 You probably want a larger workflow engine if you need thousands of distributed
-workers, long-running durable timers across machines, complex worker routing, or
-strict enterprise workflow guarantees. taskgraph targets small to medium agent
-workloads where portability and low operational overhead matter more.
+workers, cross-region timer guarantees, complex worker routing, automatic process
+supervision, or strict enterprise workflow guarantees. taskgraph targets small to
+medium agent workloads where portability and low operational overhead matter
+more.
 
 ## How it works
 
@@ -49,8 +54,8 @@ Each task belongs to a project. A project is stored in SQLite with these main
 tables:
 
 - `projects`: named containers for task graphs.
-- `tasks`: lifecycle state, metadata, result JSON, progress, retry, approval, and
-  agent ownership.
+- `tasks`: lifecycle state, metadata, result JSON, progress, retry, approval,
+  durable sleep, and agent ownership.
 - `dependencies`: edges from upstream tasks to downstream tasks.
 - `artifacts`: named outputs attached to tasks.
 - `task_notes`: comments for inter-agent communication.
@@ -62,6 +67,7 @@ Task state flow:
 ```text
 pending -> ready -> claimed -> running -> done
                                       \-> failed
+                         \-> sleeping -> running
 
 running/claimed -> ready       via pause
 pending/ready/running -> cancelled
@@ -71,6 +77,12 @@ Readiness is computed by the `task_readiness` SQL view. A task in `pending`
 becomes `ready` when all blocking upstream dependencies are complete. Claiming is
 an atomic SQLite update against the ready queue, ordered by priority and creation
 time.
+
+Sleeping is a durable wait owned by the same logical agent. A sleeping task is
+not claimable by other agents and is not reclaimed by heartbeat expiry. When its
+wake time arrives, taskgraph records a `task_wake_due` event and exposes the task
+through wake inspection APIs; the agent or harness can then resume the task using
+the stored `agent_id`.
 
 Dependency kinds:
 
@@ -184,6 +196,53 @@ taskgraph task progress t-k9x2pq --percent 50 --note "halfway"
 taskgraph task done t-k9x2pq --result '{"ok":true}'
 ```
 
+## Durable sleep and wake
+
+Use durable sleep when an agent owns a task but has nothing useful to do until a
+time-based wait expires. Examples include a model download, a training job, a
+remote API cooldown, or an external batch operation.
+
+```sh
+taskgraph go --agent trainer-1
+
+# Save any large or framework-specific state outside taskgraph, then store a
+# compact reference to it. Bare numbers are milliseconds; suffixes support ms/s/m/h.
+taskgraph sleep t-k9x2pq 3000 \
+  --state-ref '{"checkpoint":"hf-download-42","path":"/tmp/model"}' \
+  --reason "waiting for Hugging Face download"
+```
+
+`sleep` captures the current task's `agent_id`; the agent does not register
+itself separately. The task moves to `sleeping`, receives a `sleep_id`, stores
+the opaque `state_ref`, clears its heartbeat, and can safely exit. The state
+reference is intentionally opaque: taskgraph stores enough JSON to resume the
+agent, while the agent framework owns any large checkpoints, process state, model
+files, or protocol-specific data.
+
+When the wake time arrives, `taskgraph serve` emits one `task_wake_due` event per
+sleep cycle:
+
+```sh
+taskgraph events watch --project p-ab12cd --type task_wake_due
+```
+
+Without the server, a harness can still poll the durable state:
+
+```sh
+taskgraph wakes due --project p-ab12cd
+```
+
+Resume with the same logical agent. Pass `sleep_id` when you want to reject stale
+resume attempts from an older sleep cycle:
+
+```sh
+taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id sleep-a1b2c3d4
+```
+
+After resume, the task returns to `running` and the stored `state_ref` is returned
+to the caller. Downstream scheduling still depends on `done`; sleep only suspends
+the current owner.
+
 ## Interfaces
 
 taskgraph exposes the same SQLite-backed graph through three interfaces.
@@ -266,10 +325,21 @@ curl -s -X POST http://localhost:8484/api/go \
 curl -s -X POST http://localhost:8484/api/tasks/t-k9x2pq/done \
   -H 'content-type: application/json' \
   -d '{"result":{"summary":"done"},"next":true,"agent_id":"agent-1"}'
+
+curl -s -X POST http://localhost:8484/api/tasks/t-k9x2pq/sleep \
+  -H 'content-type: application/json' \
+  -d '{"duration":"3s","state_ref":{"checkpoint":"download-42"},"reason":"waiting"}'
+
+curl -s 'http://localhost:8484/api/wakes/due?project=p-ab12cd'
+
+curl -s -X POST http://localhost:8484/api/tasks/t-k9x2pq/resume \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"agent-1","sleep_id":"sleep-a1b2c3d4"}'
 ```
 
 The HTTP server runs a background sweeper that periodically promotes ready tasks,
-reclaims stale work, handles timeouts, and rolls up composite tasks.
+reclaims stale work, handles timeouts, emits due wake events, and rolls up
+composite tasks.
 
 ## CLI command reference
 
@@ -302,6 +372,11 @@ reclaims stale work, handles timeouts, and rolls up composite tasks.
 | `taskgraph task start <task_id>` | Mark claimed work as running. |
 | `taskgraph task heartbeat <task_id>` | Update liveness for claimed/running work. |
 | `taskgraph task progress <task_id> --percent N` | Save progress and an optional note. |
+| `taskgraph sleep <task_id> <duration>` | Put owned work into durable sleep. |
+| `taskgraph task sleep <task_id> <duration>` | Same as `sleep`; accepts `--state-ref` and `--reason`. |
+| `taskgraph wakes due [--project ...]` | List sleeping tasks whose wake time has arrived. |
+| `taskgraph resume <task_id> --agent <name>` | Resume a sleeping task for the same logical agent. |
+| `taskgraph task resume <task_id> --agent <name>` | Same as `resume`; accepts `--sleep-id`. |
 | `taskgraph done <task_id>` | Shortcut for `taskgraph task done`. |
 | `taskgraph task done <task_id>` | Complete a task, optionally with result JSON. |
 | `taskgraph task fail <task_id> --error ...` | Mark a running task as failed. |
@@ -322,6 +397,14 @@ taskgraph task list --status ready
 taskgraph task list --kind code
 taskgraph task list --tag backend
 taskgraph task list --agent agent-1
+```
+
+Sleep durations accept bare milliseconds or `ms`, `s`, `m`, and `h` suffixes:
+
+```sh
+taskgraph sleep t-k9x2pq 3000
+taskgraph sleep t-k9x2pq 3s --state-ref '{"external_job":"download-42"}'
+taskgraph resume t-k9x2pq --agent agent-1 --sleep-id sleep-a1b2c3d4
 ```
 
 ### Plan adaptation commands
@@ -385,9 +468,10 @@ taskgraph events watch --project p-ab12cd
 Event types include:
 
 ```text
-task_created, task_ready, task_claimed, task_started, task_completed,
-task_failed, task_retrying, task_cancelled, dependency_added,
-artifact_created, approval_requested, approval_resolved
+task_created, task_ready, task_claimed, task_started, task_sleeping,
+task_wake_due, task_resumed, task_completed, task_failed, task_retrying,
+task_cancelled, dependency_added, artifact_created, approval_requested,
+approval_resolved
 ```
 
 ## MCP tools
@@ -398,8 +482,8 @@ MCP tools mirror the CLI and return JSON strings. The main tools are:
 | --- | --- |
 | Projects | `taskgraph_project_create`, `taskgraph_project_status`, `taskgraph_project_dag`, `taskgraph_project_overview`, `taskgraph_status` |
 | Task creation | `taskgraph_task_create`, `taskgraph_task_create_batch`, `taskgraph_task_decompose`, `taskgraph_task_replan` |
-| Work loop | `taskgraph_go`, `taskgraph_task_next`, `taskgraph_task_claim`, `taskgraph_task_start`, `taskgraph_task_done` |
-| Task state | `taskgraph_task_fail`, `taskgraph_task_pause`, `taskgraph_task_update`, `taskgraph_task_get_context` |
+| Work loop | `taskgraph_go`, `taskgraph_task_next`, `taskgraph_task_claim`, `taskgraph_task_start`, `taskgraph_task_sleep`, `taskgraph_task_resume`, `taskgraph_task_done` |
+| Task state | `taskgraph_task_fail`, `taskgraph_task_pause`, `taskgraph_task_update`, `taskgraph_task_get_context`, `taskgraph_wakes_due` |
 | Dependencies | `taskgraph_dependency_add`, `taskgraph_dependency_remove` |
 | Adaptation | `taskgraph_what_if`, `taskgraph_task_insert`, `taskgraph_ahead`, `taskgraph_task_amend`, `taskgraph_task_pivot`, `taskgraph_task_split` |
 | Collaboration | `taskgraph_task_note`, `taskgraph_task_notes` |
@@ -410,8 +494,10 @@ Typical MCP flow:
 1. `taskgraph_project_create`
 2. `taskgraph_task_create` for each planned task
 3. `taskgraph_go` to claim work
-4. `taskgraph_task_done` with `result` and optionally `next: true`
-5. `taskgraph_status` or `taskgraph_project_overview` for progress
+4. `taskgraph_task_sleep` when the owning agent should save state and exit until a wake time
+5. `taskgraph_task_resume` when `taskgraph_wakes_due` or `task_wake_due` says the wait is due
+6. `taskgraph_task_done` with `result` and optionally `next: true`
+7. `taskgraph_status` or `taskgraph_project_overview` for progress
 
 ## HTTP API reference
 
@@ -439,6 +525,8 @@ All REST routes are under `/api`.
 | `POST /api/tasks/{id}/start` | Start a claimed task. |
 | `POST /api/tasks/{id}/heartbeat` | Update heartbeat. |
 | `POST /api/tasks/{id}/progress` | Update progress. |
+| `POST /api/tasks/{id}/sleep` | Put owned work into durable sleep. |
+| `POST /api/tasks/{id}/resume` | Resume a sleeping task for the same logical agent. |
 | `POST /api/tasks/{id}/done` | Complete a task. |
 | `POST /api/tasks/{id}/pause` | Pause a task. |
 | `POST /api/tasks/{id}/fail` | Fail a task. |
@@ -458,6 +546,7 @@ All REST routes are under `/api`.
 | `GET /api/tasks/{task_id}/upstream-artifacts` | List artifacts from upstream tasks. |
 | `GET /api/artifacts/{id}` | Get an artifact. |
 | `GET /api/ahead?project=...&depth=2` | Look ahead in the graph. |
+| `GET /api/wakes/due?project=...` | List sleeping tasks whose wake time has arrived. |
 | `POST /api/what-if` | Dry-run a graph mutation. |
 | `GET /api/events/stream` | Server-sent event stream. |
 
@@ -507,8 +596,14 @@ taskgraph task create-batch --file tasks.yaml
   `.taskgraph.db` directly.
 - WAL mode is enabled so readers can continue while another process writes.
 - Atomic claims rely on SQLite write serialization.
-- `taskgraph serve` runs a periodic sweeper. CLI and MCP stdio operations also
-  promote ready tasks after task creation and completion.
+- `taskgraph serve` runs the background sweeper. It promotes ready tasks,
+  reclaims stale work, handles timeouts, and emits near-exact `task_wake_due`
+  events for sleeping tasks.
+- Without relying on background wake events, durable sleep state is still stored
+  in SQLite and can be discovered with `taskgraph wakes due`. HTTP clients can
+  use `GET /api/wakes/due` when the server is running.
+- Sleeping tasks keep their `agent_id`, are not claimable by other agents, and are
+  not reclaimed by heartbeat expiry.
 - Use `--json -c` when an LLM will consume the output.
 - Use `taskgraph prompt --for cli` or `taskgraph prompt --for mcp` to generate
   agent instructions that match the installed binary.

@@ -44,6 +44,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   timeout_seconds    INTEGER,
   heartbeat_interval INTEGER NOT NULL DEFAULT 30,
   last_heartbeat     DATETIME,
+  sleep_id           TEXT,
+  sleep_until        DATETIME,
+  sleep_state_ref    JSON,
+  sleep_reason       TEXT,
+  wake_emitted_at    DATETIME,
   requires_approval  BOOLEAN NOT NULL DEFAULT FALSE,
   approval_status    TEXT,
   approved_by        TEXT,
@@ -146,6 +151,8 @@ const INDEX_TASK_FILES_PATH: &str =
     "CREATE INDEX IF NOT EXISTS idx_task_files_path ON task_files(path);";
 const INDEX_PROJECTS_USER: &str =
     "CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);";
+const INDEX_TASKS_SLEEP_UNTIL: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tasks_sleep_until ON tasks(status, sleep_until, wake_emitted_at);";
 
 const CREATE_TASK_READINESS_VIEW: &str = r#"
 CREATE VIEW IF NOT EXISTS task_readiness AS
@@ -193,6 +200,12 @@ pub fn init_db(path: &str) -> Result<Database> {
     conn.execute_batch(INDEX_TASK_NOTES_TASK)?;
     conn.execute_batch(INDEX_TASK_FILES_TASK)?;
     conn.execute_batch(INDEX_TASK_FILES_PATH)?;
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_id TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_until DATETIME;");
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_state_ref JSON;");
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_reason TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN wake_emitted_at DATETIME;");
+    conn.execute_batch(INDEX_TASKS_SLEEP_UNTIL)?;
     // Migration: add user_id column for existing databases (must run before index)
     let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN user_id TEXT;");
     conn.execute_batch(INDEX_PROJECTS_USER)?;

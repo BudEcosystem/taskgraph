@@ -6,10 +6,11 @@ use crate::db::{
     add_dependency, add_note, add_task_files, amend_task_description, approve_task,
     batch_create_tasks, cancel_task, check_file_conflicts, claim_next_task, claim_task,
     complete_task, compute_effects, create_task, fail_task, fuzzy_find_task, get_handoff_context,
-    get_lookahead, get_task, insert_task_between, list_dependencies, list_notes, list_task_files,
-    list_tasks, pause_task, pivot_subtree, project_state, promote_ready_tasks, remove_dependency,
-    snapshot_task_statuses, split_task, start_task, update_heartbeat, update_progress, update_task,
-    Database, NewSubtask, TaskgraphError, SplitPart, TaskListFilters,
+    get_lookahead, get_task, insert_task_between, list_dependencies, list_due_wakes, list_notes,
+    list_task_files, list_tasks, parse_sleep_duration_ms, pause_task, pivot_subtree, project_state,
+    promote_ready_tasks, remove_dependency, resume_task, sleep_task, snapshot_task_statuses,
+    split_task, start_task, update_heartbeat, update_progress, update_task, Database, NewSubtask,
+    SplitPart, TaskListFilters, TaskgraphError,
 };
 use crate::models::{
     generate_id, DependencyCondition, DependencyKind, RetryBackoff, Task, TaskKind, TaskStatus,
@@ -102,6 +103,10 @@ enum TaskSubcommand {
     Replan(ReplanArgs),
     #[command(about = "Pause a running task, saving progress for later resumption")]
     Pause(PauseArgs),
+    #[command(about = "Put a claimed/running task to durable sleep until a later wake time")]
+    Sleep(SleepArgs),
+    #[command(about = "Resume a sleeping task for the same logical agent")]
+    Resume(ResumeArgs),
     #[command(about = "Add a note to a task (inter-agent communication)")]
     Note(NoteArgs),
     #[command(about = "List all notes on a task")]
@@ -433,6 +438,54 @@ struct PauseArgs {
     progress: Option<i32>,
     #[arg(long, help = "Note explaining why the task was paused / what remains")]
     note: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SleepArgs {
+    #[arg(help = "Task ID to sleep")]
+    pub task_id: String,
+    #[arg(help = "Sleep duration: 3000 (ms), 3s, 5m, 1h")]
+    pub duration: String,
+    #[arg(
+        long = "state-ref",
+        alias = "state",
+        help = "Opaque JSON state reference saved for resume"
+    )]
+    pub state_ref: Option<String>,
+    #[arg(long, help = "Why the agent is sleeping")]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ResumeArgs {
+    #[arg(help = "Task ID to resume")]
+    pub task_id: String,
+    #[arg(
+        long,
+        help = "Agent identifier that originally owned the sleeping task"
+    )]
+    pub agent: String,
+    #[arg(
+        long = "sleep-id",
+        help = "Optional sleep cycle ID to prevent stale resume"
+    )]
+    pub sleep_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(about = "Inspect tasks whose durable sleep has reached its wake time")]
+pub struct WakesCommand {
+    #[command(subcommand)]
+    command: WakesSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum WakesSubcommand {
+    #[command(about = "List sleeping tasks that are due to wake")]
+    Due {
+        #[arg(long, help = "Project ID (uses default if set)")]
+        project: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -812,6 +865,8 @@ pub fn run(db: &Database, command: TaskCommand, global_json: bool, compact: bool
                 println!("paused {}", task.id);
             }
         }
+        TaskSubcommand::Sleep(args) => sleep_cmd(db, args, global_json, compact)?,
+        TaskSubcommand::Resume(args) => resume_cmd(db, args, global_json, compact)?,
         TaskSubcommand::Note(args) => {
             let note = add_note(db, &args.task_id, args.agent, &args.content)?;
             if global_json {
@@ -863,6 +918,7 @@ pub fn run(db: &Database, command: TaskCommand, global_json: bool, compact: bool
                     let mut ready = 0usize;
                     let mut claimed = 0usize;
                     let mut running = 0usize;
+                    let mut sleeping = 0usize;
                     let mut done = 0usize;
                     let mut failed = 0usize;
                     let mut cancelled = 0usize;
@@ -879,6 +935,7 @@ pub fn run(db: &Database, command: TaskCommand, global_json: bool, compact: bool
                                 }
                                 TaskStatus::Claimed => claimed += 1,
                                 TaskStatus::Running => running += 1,
+                                TaskStatus::Sleeping => sleeping += 1,
                                 TaskStatus::Done | TaskStatus::DonePartial => done += 1,
                                 TaskStatus::Failed => failed += 1,
                                 TaskStatus::Cancelled => cancelled += 1,
@@ -910,6 +967,7 @@ pub fn run(db: &Database, command: TaskCommand, global_json: bool, compact: bool
                             "ready": ready,
                             "claimed": claimed,
                             "running": running,
+                            "sleeping": sleeping,
                             "done": done,
                             "failed": failed,
                             "cancelled": cancelled,
@@ -984,6 +1042,11 @@ pub fn create_task_cmd(
         timeout_seconds: args.timeout_seconds,
         heartbeat_interval: 30,
         last_heartbeat: None,
+        sleep_id: None,
+        sleep_until: None,
+        sleep_state_ref: None,
+        sleep_reason: None,
+        wake_emitted_at: None,
         requires_approval: args.requires_approval,
         approval_status: None,
         approved_by: None,
@@ -1067,6 +1130,11 @@ fn create_batch_cmd(db: &Database, args: CreateBatchArgs, json: bool) -> Result<
             timeout_seconds: None,
             heartbeat_interval: 30,
             last_heartbeat: None,
+            sleep_id: None,
+            sleep_until: None,
+            sleep_state_ref: None,
+            sleep_reason: None,
+            wake_emitted_at: None,
             requires_approval: false,
             approval_status: None,
             approved_by: None,
@@ -1372,6 +1440,102 @@ pub fn done_cmd(db: &Database, args: DoneArgs, json: bool, compact: bool) -> Res
     Ok(())
 }
 
+fn parse_state_ref(raw: Option<String>) -> Result<Option<serde_json::Value>> {
+    match raw {
+        Some(text) => match serde_json::from_str(&text) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => Ok(Some(serde_json::Value::String(text))),
+        },
+        None => Ok(None),
+    }
+}
+
+pub fn sleep_cmd(db: &Database, args: SleepArgs, json: bool, compact: bool) -> Result<()> {
+    let duration_ms = parse_sleep_duration_ms(&args.duration)?;
+    let state_ref = parse_state_ref(args.state_ref)?;
+    let result = sleep_task(db, &args.task_id, duration_ms, state_ref, args.reason)?;
+    if json {
+        if compact {
+            print_json(&serde_json::json!({
+                "id": result.task.id,
+                "status": result.task.status,
+                "sleep_id": result.sleep_id,
+                "wake_at": result.wake_at,
+            }))?;
+        } else {
+            print_json(&result)?;
+        }
+    } else {
+        println!(
+            "sleeping {} until {} (sleep_id={})",
+            result.task.id,
+            result.wake_at.format("%Y-%m-%d %H:%M:%S"),
+            result.sleep_id
+        );
+    }
+    Ok(())
+}
+
+pub fn resume_cmd(db: &Database, args: ResumeArgs, json: bool, compact: bool) -> Result<()> {
+    let result = resume_task(db, &args.task_id, &args.agent, args.sleep_id.as_deref())?;
+    if json {
+        if compact {
+            print_json(&serde_json::json!({
+                "id": result.task.id,
+                "status": result.task.status,
+                "sleep_id": result.sleep_id,
+                "state_ref": result.state_ref,
+            }))?;
+        } else {
+            print_json(&result)?;
+        }
+    } else {
+        println!("resumed {} for {}", result.task.id, args.agent);
+        if !compact {
+            if let Some(state_ref) = result.state_ref {
+                eprintln!("state_ref: {}", serde_json::to_string(&state_ref)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn run_wakes(db: &Database, command: WakesCommand, json: bool) -> Result<()> {
+    match command.command {
+        WakesSubcommand::Due { project } => {
+            let project_id = match project {
+                Some(id) => Some(id),
+                None => crate::db::get_meta(db, "current_project")?,
+            };
+            let wakes = list_due_wakes(db, project_id.as_deref())?;
+            if json {
+                print_json(&wakes)?;
+            } else if wakes.is_empty() {
+                println!("no due wakes");
+            } else {
+                let rows = wakes
+                    .iter()
+                    .map(|wake| {
+                        vec![
+                            wake.task_id.clone(),
+                            wake.project_id.clone(),
+                            wake.agent_id.clone().unwrap_or_default(),
+                            wake.sleep_id.clone(),
+                            wake.wake_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+                            wake.reason.clone().unwrap_or_default(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                print_table(
+                    &["TASK", "PROJECT", "AGENT", "SLEEP", "WAKE_AT", "REASON"],
+                    &rows,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enrich_transition_error(
     db: &Database,
     task_id: &str,
@@ -1486,6 +1650,10 @@ pub fn go_payload(
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
         .count();
+    let sleeping = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Sleeping)
+        .count();
     let pending = tasks
         .iter()
         .filter(|t| t.status == TaskStatus::Pending)
@@ -1551,6 +1719,7 @@ pub fn go_payload(
             "done": done,
             "ready": ready,
             "running": running,
+            "sleeping": sleeping,
             "pending": pending,
         },
         "progress": progress,
@@ -1617,6 +1786,11 @@ fn decompose_or_replan(
             timeout_seconds: None,
             heartbeat_interval: 30,
             last_heartbeat: None,
+            sleep_id: None,
+            sleep_until: None,
+            sleep_state_ref: None,
+            sleep_reason: None,
+            wake_emitted_at: None,
             requires_approval: false,
             approval_status: None,
             approved_by: None,

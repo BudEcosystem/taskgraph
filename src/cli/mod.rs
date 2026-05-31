@@ -11,7 +11,9 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 
 // Re-export arg structs used by top-level aliases
-pub use task::{CreateTaskArgs, DoneArgs, GetTaskArgs, GoArgs, ListTasksArgs};
+pub use task::{
+    CreateTaskArgs, DoneArgs, GetTaskArgs, GoArgs, ListTasksArgs, ResumeArgs, SleepArgs,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -25,8 +27,10 @@ pub use task::{CreateTaskArgs, DoneArgs, GetTaskArgs, GoArgs, ListTasksArgs};
         \x20 1. taskgraph project create \"my-project\"                    Create a project\n\
         \x20 2. taskgraph task create --title \"Design API\" --dep t-xxx   Add tasks with dependencies\n\
         \x20 3. taskgraph go --agent agent-1                             Claim next ready task\n\
-        \x20 4. taskgraph done <TASK_ID> --next --agent agent-1          Complete + claim next\n\
-        \x20 5. taskgraph status                                         Check progress\n\n\
+        \x20 4. taskgraph sleep <TASK_ID> 3s --state-ref '{...}'        Sleep while waiting\n\
+        \x20 5. taskgraph wakes due                                      Inspect due sleepers\n\
+        \x20 6. taskgraph done <TASK_ID> --next --agent agent-1          Complete + claim next\n\
+        \x20 7. taskgraph status                                         Check progress\n\n\
         PLAN ADAPTATION:\n\
         \x20 taskgraph ahead              See upcoming tasks in the lookahead buffer\n\
         \x20 taskgraph what-if cancel     Preview effects of cancelling a task\n\
@@ -35,10 +39,10 @@ pub use task::{CreateTaskArgs, DoneArgs, GetTaskArgs, GoArgs, ListTasksArgs};
         \x20 taskgraph task pivot         Replace a subtree with new tasks\n\
         \x20 taskgraph task split         Decompose a task mid-execution\n\n\
         MULTI-AGENT:\n\
-        \x20 Each agent runs: taskgraph go --agent <NAME> → work → taskgraph done <ID> --next --agent <NAME>\n\
+        \x20 Each agent runs: taskgraph go --agent <NAME> → work/sleep → taskgraph done <ID> --next --agent <NAME>\n\
         \x20 The graph ensures no two agents claim the same task. Dependencies are enforced.\n\n\
         CONCEPTS:\n\
-        \x20 Task states: pending → ready (deps done) → claimed → running → done/failed\n\
+        \x20 Task states: pending → ready → claimed → running/sleeping → done/failed\n\
         \x20 Dep types:   feeds_into (default, passes result downstream), blocks, suggests\n\
         \x20 Task kinds:  generic, code, research, review, test, shell\n\
         \x20 IDs:         short 8-char (e.g. t-a1b2c3d4). Fuzzy-matched on typos.\n\n\
@@ -49,6 +53,8 @@ pub use task::{CreateTaskArgs, DoneArgs, GetTaskArgs, GoArgs, ListTasksArgs};
         \x20 taskgraph task create --title \"Design schema\" --kind research  Add a task\n\
         \x20 taskgraph task create --title \"Implement\" --dep t-a1b2c3       Add dependent task\n\
         \x20 taskgraph go --agent claude-1                                   Claim + start next ready\n\
+        \x20 taskgraph sleep t-d4e5f6 3000 --state-ref '{\"checkpoint\":\"download-42\"}'\n\
+        \x20 taskgraph resume t-d4e5f6 --agent claude-1 --sleep-id sleep-a1b2c3\n\
         \x20 taskgraph done t-d4e5f6 --result '{\"api\":\"done\"}' --next --agent claude-1\n\
         \x20 taskgraph task insert --after t-a1 --before t-b2 --title \"Add validation\"\n\
         \x20 taskgraph what-if cancel t-a1b2c3                               Preview cancel effects\n\
@@ -92,6 +98,8 @@ pub enum Commands {
     Artifact(artifact::ArtifactCommand),
     #[command(about = "List or watch project events in real-time")]
     Events(events::EventsCommand),
+    #[command(about = "Inspect durable sleep wakeups")]
+    Wakes(task::WakesCommand),
     #[command(
         about = "Show upcoming tasks after current running tasks complete.\n\n\
                   Returns the lookahead buffer: currently running tasks and the next N layers\n\
@@ -136,8 +144,14 @@ pub enum Commands {
     },
     #[command(about = "Claim + start next ready task (shortcut for 'taskgraph task go')")]
     Go(GoArgs),
-    #[command(about = "Complete a task, optionally claim next (shortcut for 'taskgraph task done')")]
+    #[command(
+        about = "Complete a task, optionally claim next (shortcut for 'taskgraph task done')"
+    )]
     Done(DoneArgs),
+    #[command(about = "Put a claimed/running task to durable sleep")]
+    Sleep(SleepArgs),
+    #[command(about = "Resume a sleeping task for the same logical agent")]
+    Resume(ResumeArgs),
     #[command(about = "List tasks with optional filters (shortcut for 'taskgraph task list')")]
     List(ListTasksArgs),
     #[command(about = "Create a new task (shortcut for 'taskgraph task create')")]
@@ -198,6 +212,7 @@ pub fn run(db: &Database, command: Commands, json: bool, compact: bool) -> Resul
         Commands::WhatIf(command) => task::run_what_if(db, command, json, compact),
         Commands::Artifact(command) => artifact::run(db, command, json),
         Commands::Events(command) => events::run(db, command, json),
+        Commands::Wakes(command) => task::run_wakes(db, command, json),
         Commands::Ahead { depth, project } => task::ahead_cmd(db, project, depth, json, compact),
         Commands::Use { project_id, clear } => {
             if clear {
@@ -237,6 +252,8 @@ pub fn run(db: &Database, command: Commands, json: bool, compact: bool) -> Resul
         } => project::status_cmd(db, project.as_deref(), detail, full, json, compact),
         Commands::Go(args) => task::go_cmd(db, &args, json),
         Commands::Done(args) => task::done_cmd(db, args, json, compact),
+        Commands::Sleep(args) => task::sleep_cmd(db, args, json, compact),
+        Commands::Resume(args) => task::resume_cmd(db, args, json, compact),
         Commands::List(args) => task::list_tasks_cmd(db, args, json, compact),
         Commands::Add(args) => task::create_task_cmd(db, args, json, compact),
         Commands::Show(args) => {
@@ -344,6 +361,7 @@ pub(crate) fn status_icon(status: &TaskStatus) -> &'static str {
     match status {
         TaskStatus::Done | TaskStatus::DonePartial => "✓",
         TaskStatus::Running | TaskStatus::Claimed => "◉",
+        TaskStatus::Sleeping => "◌",
         TaskStatus::Ready => "○",
         TaskStatus::Pending => "·",
         TaskStatus::Failed => "✗",
@@ -356,6 +374,7 @@ pub(crate) fn color_task_status(status: &TaskStatus) -> String {
     match status {
         TaskStatus::Done | TaskStatus::DonePartial => colorize(&label, "32"),
         TaskStatus::Running | TaskStatus::Claimed => colorize(&label, "33"),
+        TaskStatus::Sleeping => colorize(&label, "36"),
         TaskStatus::Ready => colorize(&label, "34"),
         TaskStatus::Pending => colorize(&label, "90"),
         TaskStatus::Failed => colorize(&label, "31"),

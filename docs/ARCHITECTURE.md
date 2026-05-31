@@ -54,8 +54,8 @@ graph TB
     end
 
     subgraph "Command Layer"
-        PORCELAIN["Porcelain<br/>go · done · add · list · show · status"]
-        PLUMBING["Plumbing<br/>claim · start · heartbeat · progress · fail<br/>insert · amend · pivot · split · decompose · replan"]
+        PORCELAIN["Porcelain<br/>go · sleep · resume · done · add · list · show · status"]
+        PLUMBING["Plumbing<br/>claim · start · heartbeat · progress · fail<br/>wakes · insert · amend · pivot · split · decompose · replan"]
     end
 
     subgraph "Core Engine"
@@ -104,6 +104,9 @@ stateDiagram-v2
     claimed --> running: start
     running --> done: complete
     running --> failed: fail
+    running --> sleeping: sleep
+    claimed --> sleeping: sleep
+    sleeping --> running: resume
     running --> ready: pause<br/>(release back to queue)
     failed --> ready: retry<br/>(if retries remain)
 
@@ -111,6 +114,7 @@ stateDiagram-v2
     claimed --> done: lenient done<br/>(auto-transitions)
 
     note right of ready: Agent entry point.<br/>go = claim + start in one call.
+    note right of sleeping: Durable wait.<br/>Same agent resumes after wake due.
     note right of done: Result stored as JSON.<br/>Triggers promote_ready_tasks().
 ```
 
@@ -119,6 +123,13 @@ stateDiagram-v2
 **`pending` vs `ready`**: This is the core of taskgraph's dependency engine. A task stays `pending` until *all* its blocking dependencies (`blocks`, `feeds_into`) are in `done` or `done_partial` state. The `task_readiness` SQL VIEW computes this atomically, and `promote_ready_tasks()` does a single bulk UPDATE. This means you never poll for readiness — completion of one task automatically unlocks the next.
 
 **`claimed` vs `running`**: In multi-agent scenarios, claiming a task is a separate concern from starting work on it. The claim is an atomic SQL UPDATE with `WHERE status = 'ready'` — SQLite guarantees only one agent wins. This is optimistic locking without a lock table.
+
+**`sleeping`**: A task can temporarily leave active execution without going back
+to the ready queue. The task keeps its `agent_id`, stores a `sleep_id`, wake time,
+and opaque `state_ref`, then clears heartbeat pressure so the owning agent can
+exit. It is not claimable by another agent and is not reclaimed as stale. When
+the wake time is reached, taskgraph emits `task_wake_due`; the same logical agent
+or its harness calls `resume`.
 
 **Lenient transitions**: After real-world testing showed agents wasting 83% of session time fighting the state machine, we added lenient transitions. `done` now accepts tasks in `ready`, `claimed`, or `running` status, auto-filling timestamps. This means a single-agent workflow is `go` → `done` (2 commands), while multi-agent safety is preserved because the claim mechanism still prevents double-assignment.
 
@@ -264,6 +275,55 @@ This handles the crash scenario — an agent dies mid-task, and the work is auto
 
 ---
 
+## Durable Sleep/Wake
+
+Long waits are common in agent work: model downloads, training jobs, remote API
+cooldowns, external batch systems, or humans taking time to respond. Keeping an
+agent process alive just to poll is wasteful, but returning the task to `ready`
+would allow another agent to steal work that already has external state.
+
+taskgraph solves this with a protocol-level sleep state, not a process manager:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant TG as taskgraph
+    participant H as Harness/Runtime
+
+    A->>TG: sleep(task_id, duration, state_ref)
+    TG->>TG: status = sleeping<br/>sleep_id + wake_at + state_ref saved
+    A-->>H: exits
+    TG->>TG: sweeper reaches wake_at
+    TG->>H: task_wake_due event / wakes_due query
+    H->>A: restart same logical agent
+    A->>TG: resume(task_id, agent_id, sleep_id)
+    TG-->>A: status = running<br/>state_ref returned
+```
+
+The key design constraints are:
+
+- **No agent registration**: sleep uses the `agent_id` already attached by claim.
+  The agent does not register a worker, callback URL, process handle, or runtime
+  identity with taskgraph.
+- **Opaque state**: `sleep_state_ref` is JSON, but taskgraph does not interpret
+  it. Agents can store a checkpoint path, external job ID, URL, protocol payload,
+  or any other compact resume token.
+- **Idempotent wake emission**: `wake_emitted_at` ensures each sleep cycle emits
+  one `task_wake_due` event even if the sweeper runs repeatedly.
+- **Owner preservation**: sleeping tasks are excluded from ready-queue claiming
+  and heartbeat reclamation. Resume requires the same logical `agent_id`; an
+  optional `sleep_id` prevents stale resume attempts.
+- **SQLite remains the source of truth**: the server's background loop only
+  optimizes timing. If no server is running, `wakes_due` can still discover due
+  tasks from the database.
+
+This deliberately stops before automatic invocation. Process restart, HTTP
+callbacks, queue publication, or framework-specific agent construction belong in
+the harness that understands the agent's protocol and runtime. taskgraph exposes
+the durable wake contract that those harnesses can consume.
+
+---
+
 ## Plan Adaptation (Mid-Flight Changes)
 
 Real-world agent work is messy. The initial plan is always wrong. taskgraph provides six primitives for changing the plan while tasks are in flight:
@@ -378,7 +438,7 @@ Events are emitted as **side-effects** of core operations, not as the source of 
 - **Events are optional**: If event emission fails, the primary operation still succeeds (`let _ =` in Rust)
 - **Events are for observability**: Dashboards, logs, SSE streams for monitoring — not for deriving state
 
-The event types map directly to lifecycle transitions: `task_created`, `task_ready`, `task_claimed`, `task_started`, `task_completed`, `task_failed`, `task_cancelled`.
+The event types map directly to lifecycle transitions: `task_created`, `task_ready`, `task_claimed`, `task_started`, `task_sleeping`, `task_wake_due`, `task_resumed`, `task_completed`, `task_failed`, `task_cancelled`.
 
 ---
 
@@ -417,6 +477,10 @@ erDiagram
         datetime claimed_at
         datetime started_at
         datetime completed_at
+        text sleep_id
+        datetime sleep_until
+        json sleep_state_ref
+        datetime wake_emitted_at
     }
     
     dependencies {
@@ -483,6 +547,8 @@ taskgraph has no concept of agent capabilities, routing rules, or agent selectio
 |---|---|---|
 | Create task | O(1) | < 1ms |
 | Claim next task | O(log n) | < 1ms (index scan) |
+| Sleep/resume task | O(1) | < 1ms |
+| Emit due wakes | O(k log n) | < 5ms for due tasks |
 | Complete task + promote | O(n) | < 5ms (n = total tasks, VIEW evaluation) |
 | List tasks (filtered) | O(n) | < 10ms for 1000 tasks |
 | What-if analysis | O(n + e) | < 50ms (n = tasks, e = edges) |

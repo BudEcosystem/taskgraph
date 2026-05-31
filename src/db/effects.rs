@@ -88,7 +88,7 @@ fn status_rank(status: &TaskStatus) -> i32 {
         TaskStatus::Pending => 0,
         TaskStatus::Ready => 1,
         TaskStatus::Claimed => 2,
-        TaskStatus::Running => 3,
+        TaskStatus::Running | TaskStatus::Sleeping => 3,
         TaskStatus::Done | TaskStatus::DonePartial => 4,
         TaskStatus::Failed | TaskStatus::Cancelled => -1,
     }
@@ -101,7 +101,7 @@ fn became_ready(before: Option<&TaskStatus>, after: &TaskStatus) -> bool {
 fn became_blocked(before: Option<&TaskStatus>, after: &TaskStatus) -> bool {
     matches!(
         before,
-        Some(TaskStatus::Ready | TaskStatus::Claimed | TaskStatus::Running)
+        Some(TaskStatus::Ready | TaskStatus::Claimed | TaskStatus::Running | TaskStatus::Sleeping)
     ) && matches!(after, TaskStatus::Pending)
 }
 

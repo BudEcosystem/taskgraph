@@ -19,6 +19,7 @@ pub enum TaskStatus {
     Ready,
     Claimed,
     Running,
+    Sleeping,
     Done,
     DonePartial,
     Failed,
@@ -32,6 +33,7 @@ impl Display for TaskStatus {
             Self::Ready => "ready",
             Self::Claimed => "claimed",
             Self::Running => "running",
+            Self::Sleeping => "sleeping",
             Self::Done => "done",
             Self::DonePartial => "done_partial",
             Self::Failed => "failed",
@@ -49,12 +51,13 @@ impl FromStr for TaskStatus {
             "ready" => Ok(Self::Ready),
             "claimed" => Ok(Self::Claimed),
             "running" => Ok(Self::Running),
+            "sleeping" => Ok(Self::Sleeping),
             "done" => Ok(Self::Done),
             "done_partial" => Ok(Self::DonePartial),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             _ => Err(format!(
-                "invalid task status: {s}. Valid: pending, ready, claimed, running, done, done_partial, failed, cancelled"
+                "invalid task status: {s}. Valid: pending, ready, claimed, running, sleeping, done, done_partial, failed, cancelled"
             )),
         }
     }
@@ -198,6 +201,11 @@ pub struct Task {
     pub timeout_seconds: Option<i64>,
     pub heartbeat_interval: i32,
     pub last_heartbeat: Option<NaiveDateTime>,
+    pub sleep_id: Option<String>,
+    pub sleep_until: Option<NaiveDateTime>,
+    pub sleep_state_ref: Option<serde_json::Value>,
+    pub sleep_reason: Option<String>,
+    pub wake_emitted_at: Option<NaiveDateTime>,
     pub requires_approval: bool,
     pub approval_status: Option<String>,
     pub approved_by: Option<String>,

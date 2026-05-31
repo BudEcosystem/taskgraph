@@ -55,6 +55,7 @@ struct ProjectStatusView {
     tasks_total: usize,
     tasks_done: usize,
     tasks_running: usize,
+    tasks_sleeping: usize,
     tasks_failed: usize,
     tasks_ready: usize,
     tasks_pending: usize,
@@ -120,6 +121,10 @@ pub fn run(db: &Database, command: ProjectCommand, json: bool, compact: bool) ->
                     .iter()
                     .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
                     .count(),
+                tasks_sleeping: tasks
+                    .iter()
+                    .filter(|t| t.status == TaskStatus::Sleeping)
+                    .count(),
                 tasks_failed: tasks
                     .iter()
                     .filter(|t| t.status == TaskStatus::Failed)
@@ -146,6 +151,7 @@ pub fn run(db: &Database, command: ProjectCommand, json: bool, compact: bool) ->
                         "done": view.tasks_done,
                         "ready": view.tasks_ready,
                         "running": view.tasks_running,
+                        "sleeping": view.tasks_sleeping,
                         "pending": view.tasks_pending,
                         "failed": view.tasks_failed,
                         "progress_pct": progress_pct,
@@ -157,10 +163,11 @@ pub fn run(db: &Database, command: ProjectCommand, json: bool, compact: bool) ->
                 println!("project: {} ({})", view.project.id, view.project.name);
                 println!("status: {}", view.project.status);
                 println!(
-                    "tasks: total={} done={} running={} ready={} pending={} failed={}",
+                    "tasks: total={} done={} running={} sleeping={} ready={} pending={} failed={}",
                     view.tasks_total,
                     view.tasks_done,
                     view.tasks_running,
+                    view.tasks_sleeping,
                     view.tasks_ready,
                     view.tasks_pending,
                     view.tasks_failed
@@ -206,6 +213,10 @@ pub fn status_cmd(
     let running: Vec<_> = tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
+        .collect();
+    let sleeping: Vec<_> = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Sleeping)
         .collect();
     let blocked = tasks
         .iter()
@@ -298,7 +309,10 @@ pub fn status_cmd(
                 };
                 let mut line = format!("{prefix}{connector}{icon} {} {}", task.id, task.title);
                 if let Some(agent) = &task.agent_id {
-                    if matches!(task.status, TaskStatus::Running | TaskStatus::Claimed) {
+                    if matches!(
+                        task.status,
+                        TaskStatus::Running | TaskStatus::Claimed | TaskStatus::Sleeping
+                    ) {
                         line.push_str(&format!(" @{agent}"));
                     }
                 }
@@ -349,6 +363,7 @@ pub fn status_cmd(
                 "done": done,
                 "ready": ready_ids.len(),
                 "running": running.len(),
+                "sleeping": sleeping.len(),
                 "blocked": blocked,
                 "progress": format!("{}%", progress_pct),
                 "ready_ids": ready_ids,
@@ -381,9 +396,32 @@ pub fn status_cmd(
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let sleeping_str = if sleeping.is_empty() {
+            "-".to_string()
+        } else {
+            sleeping
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}@{}",
+                        t.id,
+                        t.agent_id.clone().unwrap_or_else(|| "-".to_string())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         println!(
-            "{} {}: {}/{} done ({}%) | ready: {} | running: {} | blocked: {}",
-            project.id, project.name, done, total, progress_pct, ready_str, running_str, blocked
+            "{} {}: {}/{} done ({}%) | ready: {} | running: {} | sleeping: {} | blocked: {}",
+            project.id,
+            project.name,
+            done,
+            total,
+            progress_pct,
+            ready_str,
+            running_str,
+            sleeping_str,
+            blocked
         );
     }
 
@@ -502,7 +540,10 @@ fn render_node(
         )
     };
     if let Some(agent) = &task.agent_id {
-        if matches!(task.status, TaskStatus::Running | TaskStatus::Claimed) {
+        if matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::Claimed | TaskStatus::Sleeping
+        ) {
             line.push_str(&format!(" ({agent})"));
         }
     }

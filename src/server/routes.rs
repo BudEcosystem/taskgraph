@@ -19,7 +19,10 @@ type AppState = Arc<Database>;
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
-        .route("/projects", post(create_project_handler).get(list_projects_handler))
+        .route(
+            "/projects",
+            post(create_project_handler).get(list_projects_handler),
+        )
         .route(
             "/projects/{id}",
             get(get_project_handler).patch(update_project_status_handler),
@@ -35,7 +38,10 @@ pub fn api_routes() -> Router<AppState> {
             post(batch_create_tasks_handler),
         )
         .route("/projects/{project_id}/events", get(list_events_handler))
-        .route("/tasks/{id}", get(get_task_handler).patch(update_task_handler))
+        .route(
+            "/tasks/{id}",
+            get(get_task_handler).patch(update_task_handler),
+        )
         .route("/tasks/{id}/context", get(get_task_context_handler))
         .route("/go", post(go_handler))
         .route("/tasks/{id}/claim", post(claim_task_handler))
@@ -43,7 +49,12 @@ pub fn api_routes() -> Router<AppState> {
         .route("/tasks/{id}/heartbeat", post(task_heartbeat_handler))
         .route("/tasks/{id}/progress", post(task_progress_handler))
         .route("/tasks/{id}/done", post(done_task_handler))
-        .route("/tasks/{id}/notes", post(add_task_note_handler).get(list_task_notes_handler))
+        .route("/tasks/{id}/sleep", post(sleep_task_handler))
+        .route("/tasks/{id}/resume", post(resume_task_handler))
+        .route(
+            "/tasks/{id}/notes",
+            post(add_task_note_handler).get(list_task_notes_handler),
+        )
         .route("/tasks/{id}/pause", post(pause_task_handler))
         .route("/tasks/{id}/fail", post(fail_task_handler))
         .route("/tasks/{id}/cancel", post(cancel_task_handler))
@@ -53,9 +64,13 @@ pub fn api_routes() -> Router<AppState> {
             "/tasks/{task_id}/artifacts",
             post(create_artifact_handler).get(list_task_artifacts_handler),
         )
-        .route("/tasks/{task_id}/upstream-artifacts", get(upstream_artifacts_handler))
+        .route(
+            "/tasks/{task_id}/upstream-artifacts",
+            get(upstream_artifacts_handler),
+        )
         .route("/artifacts/{id}", get(get_artifact_handler))
         .route("/events/stream", get(event_stream_handler))
+        .route("/wakes/due", get(due_wakes_handler))
         .route(
             "/tasks/{id}/deps",
             post(add_dependency_handler).delete(remove_dependency_handler),
@@ -253,6 +268,19 @@ pub struct PauseRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SleepRequest {
+    duration: String,
+    state_ref: Option<Value>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResumeRequest {
+    agent_id: String,
+    sleep_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FailRequest {
     error: String,
 }
@@ -291,6 +319,11 @@ pub struct ListEventsQuery {
     event_type: Option<String>,
     since: Option<String>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DueWakesQuery {
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -402,6 +435,7 @@ struct OverviewSummary {
     ready: usize,
     claimed: usize,
     running: usize,
+    sleeping: usize,
     done: usize,
     failed: usize,
     cancelled: usize,
@@ -466,7 +500,8 @@ fn parse_retry_backoff(raw: Option<String>) -> Result<RetryBackoff, ApiError> {
 
 fn parse_event_type(raw: Option<String>) -> Result<Option<EventType>, ApiError> {
     raw.map(|v| {
-        EventType::from_str(&v).map_err(|_| ApiError::bad_request(format!("invalid event type: {v}")))
+        EventType::from_str(&v)
+            .map_err(|_| ApiError::bad_request(format!("invalid event type: {v}")))
     })
     .transpose()
 }
@@ -523,12 +558,22 @@ fn go_response(db: &Database, project_id: &str, agent_id: &str) -> Result<Value,
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Done | TaskStatus::DonePartial))
         .count();
-    let ready = tasks.iter().filter(|t| t.status == TaskStatus::Ready).count();
+    let ready = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Ready)
+        .count();
     let running = tasks
         .iter()
         .filter(|t| matches!(t.status, TaskStatus::Running | TaskStatus::Claimed))
         .count();
-    let pending = tasks.iter().filter(|t| t.status == TaskStatus::Pending).count();
+    let sleeping = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Sleeping)
+        .count();
+    let pending = tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Pending)
+        .count();
     let progress = if total == 0 {
         "0%".to_string()
     } else {
@@ -586,6 +631,7 @@ fn go_response(db: &Database, project_id: &str, agent_id: &str) -> Result<Value,
             "done": done,
             "ready": ready,
             "running": running,
+            "sleeping": sleeping,
             "pending": pending,
         },
         "progress": progress,
@@ -627,6 +673,11 @@ fn build_task(project_id: &str, req: &CreateTaskRequest) -> Result<(Task, Vec<St
         timeout_seconds: req.timeout_seconds,
         heartbeat_interval: req.heartbeat_interval.unwrap_or(30),
         last_heartbeat: None,
+        sleep_id: None,
+        sleep_until: None,
+        sleep_state_ref: None,
+        sleep_reason: None,
+        wake_emitted_at: None,
         requires_approval: req.requires_approval.unwrap_or(false),
         approval_status: None,
         approved_by: None,
@@ -643,7 +694,14 @@ pub async fn create_project_handler(
     State(db): State<AppState>,
     Json(body): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let project = create_project(&db, &body.name, body.description, body.metadata, body.user_id).map_err(ApiError::from)?;
+    let project = create_project(
+        &db,
+        &body.name,
+        body.description,
+        body.metadata,
+        body.user_id,
+    )
+    .map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(project)))
 }
 
@@ -799,10 +857,7 @@ pub async fn batch_create_tasks_handler(
 
     let created = batch_create_tasks(&db, &tasks).map_err(ApiError::from)?;
     let _ = promote_ready_tasks(&db).map_err(ApiError::from)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(BatchCreateResponse { created }),
-    ))
+    Ok((StatusCode::CREATED, Json(BatchCreateResponse { created })))
 }
 
 pub async fn list_tasks_handler(
@@ -885,7 +940,9 @@ pub async fn claim_task_handler(
         return Err(ApiError::not_found(format!("Task {task_id} not found")));
     }
     let Some(task) = claim_task(&db, &task_id, &body.agent_id).map_err(ApiError::from)? else {
-        return Err(ApiError::conflict(format!("Task {task_id} is not ready to claim")));
+        return Err(ApiError::conflict(format!(
+            "Task {task_id} is not ready to claim"
+        )));
     };
     emit_event(
         &db,
@@ -940,7 +997,8 @@ pub async fn task_progress_handler(
             return Err(ApiError::bad_request("percent must be between 0 and 100"));
         }
     }
-    let changed = update_progress(&db, &task_id, body.percent, body.note).map_err(ApiError::from)?;
+    let changed =
+        update_progress(&db, &task_id, body.percent, body.note).map_err(ApiError::from)?;
     if changed == 0 {
         return Err(ApiError::not_found(format!("Task {task_id} not found")));
     }
@@ -977,8 +1035,36 @@ pub async fn done_task_handler(
             "next": next,
         })))
     } else {
-        Ok(Json(serde_json::to_value(task).map_err(|e| ApiError::internal(e.to_string()))?))
+        Ok(Json(
+            serde_json::to_value(task).map_err(|e| ApiError::internal(e.to_string()))?,
+        ))
     }
+}
+
+pub async fn sleep_task_handler(
+    State(db): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<SleepRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let duration_ms = parse_sleep_duration_ms(&body.duration)
+        .map_err(|e| ApiError::bad_request(format!("invalid duration '{}': {e}", body.duration)))?;
+    let result = sleep_task(&db, &task_id, duration_ms, body.state_ref, body.reason)
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::to_value(result).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
+}
+
+pub async fn resume_task_handler(
+    State(db): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<ResumeRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let result = resume_task(&db, &task_id, &body.agent_id, body.sleep_id.as_deref())
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::to_value(result).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
 
 pub async fn go_handler(
@@ -988,6 +1074,14 @@ pub async fn go_handler(
     ensure_project_exists(&db, &body.project_id)?;
     let payload = go_response(&db, &body.project_id, &body.agent_id)?;
     Ok(Json(payload))
+}
+
+pub async fn due_wakes_handler(
+    State(db): State<AppState>,
+    Query(query): Query<DueWakesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let wakes = list_due_wakes(&db, query.project.as_deref()).map_err(ApiError::from)?;
+    Ok(Json(wakes))
 }
 
 pub async fn add_task_note_handler(
@@ -1049,9 +1143,12 @@ pub async fn cancel_task_handler(
     Query(query): Query<CancelQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let task = get_task(&db, &task_id).map_err(ApiError::from)?;
-    let cancelled = cancel_task(&db, &task_id, query.cascade.unwrap_or(false)).map_err(ApiError::from)?;
+    let cancelled =
+        cancel_task(&db, &task_id, query.cascade.unwrap_or(false)).map_err(ApiError::from)?;
     if cancelled == 0 {
-        return Err(ApiError::conflict(format!("Task {task_id} cannot be cancelled")));
+        return Err(ApiError::conflict(format!(
+            "Task {task_id} cannot be cancelled"
+        )));
     }
     emit_event(
         &db,
@@ -1101,7 +1198,8 @@ pub async fn next_task_handler(
     ensure_project_exists(&db, &body.project_id)?;
     let claim = body.claim.unwrap_or(true);
     if claim {
-        let task = claim_next_task(&db, &body.project_id, &body.agent_id).map_err(ApiError::from)?;
+        let task =
+            claim_next_task(&db, &body.project_id, &body.agent_id).map_err(ApiError::from)?;
         if let Some(task) = &task {
             emit_event(
                 &db,
@@ -1357,6 +1455,7 @@ pub async fn project_overview_handler(
         ready: 0,
         claimed: 0,
         running: 0,
+        sleeping: 0,
         done: 0,
         failed: 0,
         cancelled: 0,
@@ -1374,6 +1473,7 @@ pub async fn project_overview_handler(
                 }
                 TaskStatus::Claimed => summary.claimed += 1,
                 TaskStatus::Running => summary.running += 1,
+                TaskStatus::Sleeping => summary.sleeping += 1,
                 TaskStatus::Done | TaskStatus::DonePartial => summary.done += 1,
                 TaskStatus::Failed => summary.failed += 1,
                 TaskStatus::Cancelled => summary.cancelled += 1,
@@ -1464,6 +1564,11 @@ pub async fn decompose_task_handler(
             timeout_seconds: None,
             heartbeat_interval: 30,
             last_heartbeat: None,
+            sleep_id: None,
+            sleep_until: None,
+            sleep_state_ref: None,
+            sleep_reason: None,
+            wake_emitted_at: None,
             requires_approval: false,
             approval_status: None,
             approved_by: None,
@@ -1569,7 +1674,9 @@ pub async fn amend_task_handler(
     Json(body): Json<AmendTaskRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let task = amend_task_description(&db, &task_id, &body.prepend).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(task).map_err(|e| ApiError::internal(e.to_string()))?))
+    Ok(Json(
+        serde_json::to_value(task).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
 
 pub async fn pivot_task_handler(
@@ -1587,8 +1694,7 @@ pub async fn pivot_task_handler(
         body.subtasks,
     )
     .map_err(ApiError::from)?;
-    let after_snapshot =
-        snapshot_task_statuses(&db, &parent.project_id).map_err(ApiError::from)?;
+    let after_snapshot = snapshot_task_statuses(&db, &parent.project_id).map_err(ApiError::from)?;
     let effect = compute_effects(&db, &parent.project_id, &before_snapshot, &after_snapshot)
         .map_err(ApiError::from)?;
     Ok(Json(json!({
@@ -1609,8 +1715,7 @@ pub async fn split_task_handler(
     let before_snapshot =
         snapshot_task_statuses(&db, &parent.project_id).map_err(ApiError::from)?;
     let result = split_task(&db, &task_id, body.parts).map_err(ApiError::from)?;
-    let after_snapshot =
-        snapshot_task_statuses(&db, &parent.project_id).map_err(ApiError::from)?;
+    let after_snapshot = snapshot_task_statuses(&db, &parent.project_id).map_err(ApiError::from)?;
     let effect = compute_effects(&db, &parent.project_id, &before_snapshot, &after_snapshot)
         .map_err(ApiError::from)?;
     Ok(Json(json!({
@@ -1627,8 +1732,11 @@ pub async fn ahead_handler(
     State(db): State<AppState>,
     Query(query): Query<AheadQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let lookahead = get_lookahead(&db, &query.project, query.depth.unwrap_or(2)).map_err(ApiError::from)?;
-    Ok(Json(serde_json::to_value(lookahead).map_err(|e| ApiError::internal(e.to_string()))?))
+    let lookahead =
+        get_lookahead(&db, &query.project, query.depth.unwrap_or(2)).map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::to_value(lookahead).map_err(|e| ApiError::internal(e.to_string()))?,
+    ))
 }
 
 pub async fn what_if_handler(
@@ -1680,7 +1788,8 @@ pub async fn what_if_handler(
             let title = body
                 .title
                 .ok_or_else(|| ApiError::bad_request("title is required for insert"))?;
-            let before_snapshot = snapshot_task_statuses(&db, &project_id).map_err(ApiError::from)?;
+            let before_snapshot =
+                snapshot_task_statuses(&db, &project_id).map_err(ApiError::from)?;
             {
                 let mut conn = db.lock().map_err(ApiError::from)?;
                 let tx = conn
@@ -1727,7 +1836,9 @@ pub async fn what_if_handler(
     }
 }
 
-pub fn parse_event_stream_query(query: &EventStreamQuery) -> Result<(Option<String>, Option<EventType>), ApiError> {
+pub fn parse_event_stream_query(
+    query: &EventStreamQuery,
+) -> Result<(Option<String>, Option<EventType>), ApiError> {
     let event_type = parse_event_type(query.event_type.clone())?;
     Ok((query.project_id.clone(), event_type))
 }
