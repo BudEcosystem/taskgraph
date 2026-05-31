@@ -1,87 +1,222 @@
 # taskgraph
 
-A task graph primitive for AI agent orchestration. Zero-config, embedded, powered by SQLite.
+taskgraph is a small, SQLite-backed task graph for AI agent orchestration.
 
-Most agent workloads don't need a separate orchestration service—they just need a file.
+It gives agents a shared project plan, a dependency-aware ready queue, atomic task
+claiming, result handoff, artifacts, notes, events, and plan adaptation without
+running a separate workflow service. For local use, the coordination layer is just
+one file: `.taskgraph.db`.
+
+## What taskgraph does
+
+taskgraph turns a plan into a directed graph of tasks:
+
+- tasks have states such as `pending`, `ready`, `claimed`, `running`, `done`,
+  `failed`, and `cancelled`;
+- dependencies decide when downstream work becomes ready;
+- agents atomically claim ready work so two agents do not pick the same task;
+- completed task results are stored as JSON and included as handoff context for
+  downstream tasks;
+- notes, artifacts, events, progress, files, retries, timeouts, and approvals are
+  tracked beside the task graph;
+- plans can be changed while work is in progress with insert, amend, split,
+  pivot, decompose, and replan operations.
+
+It is not an agent framework. It does not run models, route work by capability, or
+own your prompts. It is the coordination primitive that agents, scripts, MCP
+clients, or dashboards can share.
+
+## Who needs it
+
+Use taskgraph when you have:
+
+- an AI coding or research task with multiple ordered steps;
+- several agents or scripts that need to coordinate without stepping on each
+  other;
+- a plan that may change after new information appears;
+- a local-first workflow where a single binary and SQLite file are preferable to
+  Redis, a queue, or a workflow server;
+- an MCP-compatible editor or agent that needs tools for planning and execution.
+
+You probably want a larger workflow engine if you need thousands of distributed
+workers, long-running durable timers across machines, complex worker routing, or
+strict enterprise workflow guarantees. taskgraph targets small to medium agent
+workloads where portability and low operational overhead matter more.
+
+## How it works
+
+Each task belongs to a project. A project is stored in SQLite with these main
+tables:
+
+- `projects`: named containers for task graphs.
+- `tasks`: lifecycle state, metadata, result JSON, progress, retry, approval, and
+  agent ownership.
+- `dependencies`: edges from upstream tasks to downstream tasks.
+- `artifacts`: named outputs attached to tasks.
+- `task_notes`: comments for inter-agent communication.
+- `task_files`: files touched by tasks for conflict checks.
+- `events`: audit and monitoring log.
+
+Task state flow:
+
+```text
+pending -> ready -> claimed -> running -> done
+                                      \-> failed
+
+running/claimed -> ready       via pause
+pending/ready/running -> cancelled
+```
+
+Readiness is computed by the `task_readiness` SQL view. A task in `pending`
+becomes `ready` when all blocking upstream dependencies are complete. Claiming is
+an atomic SQLite update against the ready queue, ordered by priority and creation
+time.
+
+Dependency kinds:
+
+| Kind | Blocks readiness | Intended use |
+| --- | --- | --- |
+| `feeds_into` | Yes | Upstream work produces context or artifacts for downstream work. This is the default for `--dep`. |
+| `blocks` | Yes | Ordering constraint where the downstream task should wait. |
+| `suggests` | No | Soft relationship used for context, not scheduling. |
+
+Task kinds:
+
+```text
+generic, code, research, review, test, shell
+```
+
+IDs are short and human-typed, such as `p-ab12cd` for projects and `t-k9x2pq`
+for tasks.
 
 ## Install
+
+Install the latest release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/BudEcosystem/taskgraph/main/install.sh | sh
 ```
 
-Or build from source:
+Build from source:
 
 ```sh
 cargo build --release
-# binary: target/release/taskgraph
+./target/release/taskgraph --version
 ```
+
+Run with Docker:
+
+```sh
+docker compose up
+```
+
+The Docker image starts the HTTP server on port `8484` and stores the database in
+the `taskgraph-data` volume.
 
 ## Quick start
 
+Create a project. This also sets it as the default project for later commands:
+
 ```sh
-# Create a project
-taskgraph project create "my-project"
+taskgraph init "auth-system" --description "Implement auth for the API"
+```
 
-# Add tasks with dependencies
-taskgraph add --title "Design API" --kind research
-taskgraph add --title "Implement endpoints" --kind code --dep feeds_into:<DESIGN_ID>
-taskgraph add --title "Write tests" --kind test --dep feeds_into:<IMPL_ID>
+Add tasks. A task with no dependencies becomes ready immediately. A task with a
+dependency stays pending until the upstream task is done:
 
-# Claim the next ready task and start working
+```sh
+taskgraph add --title "Design auth schema" --kind research
+taskgraph add --title "Implement auth endpoints" --kind code --dep <DESIGN_TASK_ID>
+taskgraph add --title "Write integration tests" --kind test --dep <IMPLEMENT_TASK_ID>
+```
+
+Use the real task IDs printed by the previous commands. Dependency syntax is
+`--dep TASK_ID` for the default `feeds_into` edge, or `--dep TASK_ID:blocks`,
+`--dep TASK_ID:feeds_into`, or `--dep TASK_ID:suggests`.
+
+Claim and start the next ready task:
+
+```sh
 taskgraph go --agent agent-1
+```
 
-# Complete the task and auto-claim the next one
-taskgraph done <TASK_ID> --result '{"schema": "v1"}' --next --agent agent-1
+Complete the task, pass result data to downstream tasks, record changed files, and
+optionally claim the next task in one command:
 
-# Check progress
+```sh
+taskgraph done t-k9x2pq \
+  --result '{"summary":"schema designed","tables":["users","sessions"]}' \
+  --files "docs/auth-schema.md" \
+  --next \
+  --agent agent-1
+```
+
+Check progress:
+
+```sh
 taskgraph status
+taskgraph status --detail
+taskgraph task overview --json -c
 ```
 
-## How it works
+## Core workflow for agents
 
-taskgraph manages a dependency-aware task graph stored in a single SQLite file (`.taskgraph.db`). Agents claim tasks atomically, complete them, and results flow downstream through the handoff protocol.
+The recommended loop is intentionally small:
 
-**Task lifecycle:**
-
+```sh
+taskgraph go --agent <agent-name>
+# do the work returned by taskgraph
+taskgraph done <task-id> --result '<json-or-text>' --next --agent <agent-name>
 ```
-pending → ready → claimed → running → done
-                                    → failed
+
+`go` returns the task, upstream handoff context, notes, file conflict information,
+and remaining project counts. `done --next` completes the current task and calls
+`go` again for the same agent.
+
+For more precise control, use the plumbing commands:
+
+```sh
+taskgraph task next --agent agent-1
+taskgraph task claim t-k9x2pq --agent agent-1
+taskgraph task start t-k9x2pq
+taskgraph task heartbeat t-k9x2pq
+taskgraph task progress t-k9x2pq --percent 50 --note "halfway"
+taskgraph task done t-k9x2pq --result '{"ok":true}'
 ```
 
-Tasks are automatically promoted from `pending` to `ready` when all blocking dependencies are satisfied.
+## Interfaces
 
-**Dependency types:**
-
-| Type | Meaning |
-|------|---------|
-| `feeds_into` | Passes result data to downstream task |
-| `blocks` | Ordering constraint only |
-| `suggests` | Soft dependency (doesn't block promotion) |
-
-**Multi-agent coordination:** Atomic claim ensures no two agents grab the same task. Any agent can claim any ready task—routing logic belongs in your agent framework, not here.
-
-## Three interfaces
+taskgraph exposes the same SQLite-backed graph through three interfaces.
 
 ### CLI
 
+The CLI is best for local agents, shell scripts, and humans:
+
 ```sh
-taskgraph go --agent agent-1
-taskgraph done <ID> --next --agent agent-1
-taskgraph status
+taskgraph --help
+taskgraph project create "my-project"
+taskgraph add --title "First task"
+taskgraph go --agent cli-agent
 ```
 
-Porcelain commands (`go`, `done`, `add`, `list`, `status`) for common workflows. Plumbing commands (`claim`, `start`, `complete`, `heartbeat`) for precise control.
+Useful global options:
+
+| Option | Description |
+| --- | --- |
+| `--db <PATH>` | SQLite database path. Defaults to `.taskgraph.db`. |
+| `--json` | Print structured JSON. |
+| `-c`, `--compact` | Print token-efficient output for LLM context windows. |
 
 ### MCP server
 
-For Claude Code, Cursor, Windsurf, and other MCP-compatible tools:
+Use MCP when you want Claude Code, Cursor, Windsurf, or another MCP client to call
+taskgraph tools directly:
 
 ```sh
 taskgraph mcp
 ```
 
-Add to your MCP config:
+Example MCP config:
 
 ```json
 {
@@ -94,47 +229,294 @@ Add to your MCP config:
 }
 ```
 
-### HTTP API
+You can also generate ready-to-paste integration text:
+
+```sh
+taskgraph prompt --list
+taskgraph prompt --for mcp
+taskgraph prompt --for cli
+taskgraph prompt --for http
+```
+
+### HTTP API and SSE
+
+Start the server:
 
 ```sh
 taskgraph serve --port 8484
 ```
 
-REST endpoints at `/api/*`, SSE event stream at `/events`, and MCP-over-HTTP at `/mcp`.
+Available surfaces:
 
-## Plan adaptation
+| Surface | URL |
+| --- | --- |
+| REST API | `http://localhost:8484/api` |
+| Event stream | `http://localhost:8484/api/events/stream` |
+| MCP over HTTP | `http://localhost:8484/mcp` |
 
-Modify the plan mid-execution with six primitives:
-
-| Command | What it does |
-|---------|-------------|
-| `insert` | Add a step between two tasks |
-| `amend` | Prepend context to a future task |
-| `split` | Break one task into multiple |
-| `pivot` | Replace a subtree with new tasks |
-| `decompose` | Create subtasks from YAML |
-| `replan` | Replace a subtree with a new YAML plan |
-
-## Docker
+Example HTTP calls:
 
 ```sh
-docker compose up
-# API available at http://localhost:8484
+curl -s http://localhost:8484/api/projects
+
+curl -s -X POST http://localhost:8484/api/go \
+  -H 'content-type: application/json' \
+  -d '{"project_id":"p-ab12cd","agent_id":"agent-1"}'
+
+curl -s -X POST http://localhost:8484/api/tasks/t-k9x2pq/done \
+  -H 'content-type: application/json' \
+  -d '{"result":{"summary":"done"},"next":true,"agent_id":"agent-1"}'
+```
+
+The HTTP server runs a background sweeper that periodically promotes ready tasks,
+reclaims stale work, handles timeouts, and rolls up composite tasks.
+
+## CLI command reference
+
+### Project commands
+
+| Command | Purpose |
+| --- | --- |
+| `taskgraph init <name>` | Create a project and set it as default. |
+| `taskgraph project create <name>` | Create a project and set it as default. |
+| `taskgraph project list` | List projects. |
+| `taskgraph project status [project_id]` | Show counts for a project. |
+| `taskgraph project dag [project_id]` | Render the dependency graph as a tree. |
+| `taskgraph use [project_id]` | Show or set the default project. |
+| `taskgraph use --clear` | Clear the default project. |
+
+### Task commands
+
+| Command | Purpose |
+| --- | --- |
+| `taskgraph add --title ...` | Shortcut for `taskgraph task create`. |
+| `taskgraph task create` | Create one task. |
+| `taskgraph task create-batch --file tasks.yaml` | Create many tasks from YAML. |
+| `taskgraph list` | Shortcut for `taskgraph task list`. |
+| `taskgraph task list` | List tasks with filters. |
+| `taskgraph show <task_id>` | Shortcut for `taskgraph task get`. |
+| `taskgraph task get <task_id>` | Show a task. Supports fuzzy ID matching. |
+| `taskgraph task next --agent <name>` | Peek or claim the next ready task. |
+| `taskgraph go --agent <name>` | Claim and start the next ready task. |
+| `taskgraph task claim <task_id> --agent <name>` | Claim a specific ready task. |
+| `taskgraph task start <task_id>` | Mark claimed work as running. |
+| `taskgraph task heartbeat <task_id>` | Update liveness for claimed/running work. |
+| `taskgraph task progress <task_id> --percent N` | Save progress and an optional note. |
+| `taskgraph done <task_id>` | Shortcut for `taskgraph task done`. |
+| `taskgraph task done <task_id>` | Complete a task, optionally with result JSON. |
+| `taskgraph task fail <task_id> --error ...` | Mark a running task as failed. |
+| `taskgraph task pause <task_id>` | Return claimed/running work to ready with progress. |
+| `taskgraph task cancel <task_id> [--cascade]` | Cancel a task, optionally downstream tasks too. |
+| `taskgraph task approve <task_id>` | Approve work that requires human approval. |
+| `taskgraph task update <task_id>` | Update title, description, kind, or priority. |
+| `taskgraph task add-dep <to_task> --after <from_task>` | Add a dependency edge. |
+| `taskgraph task remove-dep <to_task> --after <from_task>` | Remove a dependency edge. |
+| `taskgraph task note <task_id> "text"` | Add a task note. |
+| `taskgraph task notes <task_id>` | List notes for a task. |
+| `taskgraph task overview` | Show all tasks, dependencies, and summary. |
+
+Task list filters:
+
+```sh
+taskgraph task list --status ready
+taskgraph task list --kind code
+taskgraph task list --tag backend
+taskgraph task list --agent agent-1
+```
+
+### Plan adaptation commands
+
+| Command | Purpose |
+| --- | --- |
+| `taskgraph ahead --depth 3` | See running work and upcoming dependency layers. |
+| `taskgraph what-if cancel <task_id>` | Preview cancellation effects without changing the graph. |
+| `taskgraph what-if insert --after A --before B --title ...` | Preview insertion effects. |
+| `taskgraph task insert --after A --before B --title ...` | Insert a new task between existing tasks and rewire edges. |
+| `taskgraph task amend <task_id> --prepend "NOTE: ..."` | Add context to a future task description. |
+| `taskgraph task split <task_id> --into '[...]'` | Split one task into executable parts. |
+| `taskgraph task decompose <task_id> --file subtasks.yaml` | Turn a task into a composite parent with subtasks. |
+| `taskgraph task replan <task_id> --file subtasks.yaml` | Cancel remaining pending subtasks and create replacements. |
+| `taskgraph task pivot <task_id> --file new-plan.yaml` | Replace a task subtree. |
+
+Example `split` JSON:
+
+```sh
+taskgraph task split t-parent \
+  --into '[{"title":"Add model","description":"Create data model"},{"title":"Add API","deps_on":["Add model"]}]'
+```
+
+Example decomposition YAML:
+
+```yaml
+subtasks:
+  - title: "Design schema"
+    kind: research
+  - title: "Implement migrations"
+    kind: code
+    deps_on: ["Design schema"]
+  - title: "Test migrations"
+    kind: test
+    deps_on: ["Implement migrations"]
+```
+
+### Artifacts
+
+Artifacts are named outputs attached to a task. Use them for reports, generated
+configs, snippets, or file-backed outputs.
+
+```sh
+taskgraph artifact write --task t-k9x2pq --name schema --file docs/schema.md --kind report
+taskgraph artifact write --task t-k9x2pq --name summary --content '{"ok":true}' --mime application/json
+taskgraph artifact list --task t-k9x2pq
+taskgraph artifact read --task t-k9x2pq --name schema
+```
+
+### Events
+
+Events are emitted for task lifecycle changes, dependency changes, artifacts, and
+approval resolution.
+
+```sh
+taskgraph events list --project p-ab12cd
+taskgraph events list --project p-ab12cd --type task_completed --limit 20
+taskgraph events watch --project p-ab12cd
+```
+
+Event types include:
+
+```text
+task_created, task_ready, task_claimed, task_started, task_completed,
+task_failed, task_retrying, task_cancelled, dependency_added,
+artifact_created, approval_requested, approval_resolved
+```
+
+## MCP tools
+
+MCP tools mirror the CLI and return JSON strings. The main tools are:
+
+| Area | Tools |
+| --- | --- |
+| Projects | `taskgraph_project_create`, `taskgraph_project_status`, `taskgraph_project_dag`, `taskgraph_project_overview`, `taskgraph_status` |
+| Task creation | `taskgraph_task_create`, `taskgraph_task_create_batch`, `taskgraph_task_decompose`, `taskgraph_task_replan` |
+| Work loop | `taskgraph_go`, `taskgraph_task_next`, `taskgraph_task_claim`, `taskgraph_task_start`, `taskgraph_task_done` |
+| Task state | `taskgraph_task_fail`, `taskgraph_task_pause`, `taskgraph_task_update`, `taskgraph_task_get_context` |
+| Dependencies | `taskgraph_dependency_add`, `taskgraph_dependency_remove` |
+| Adaptation | `taskgraph_what_if`, `taskgraph_task_insert`, `taskgraph_ahead`, `taskgraph_task_amend`, `taskgraph_task_pivot`, `taskgraph_task_split` |
+| Collaboration | `taskgraph_task_note`, `taskgraph_task_notes` |
+| Artifacts | `taskgraph_artifact_write`, `taskgraph_artifact_read` |
+
+Typical MCP flow:
+
+1. `taskgraph_project_create`
+2. `taskgraph_task_create` for each planned task
+3. `taskgraph_go` to claim work
+4. `taskgraph_task_done` with `result` and optionally `next: true`
+5. `taskgraph_status` or `taskgraph_project_overview` for progress
+
+## HTTP API reference
+
+All REST routes are under `/api`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `POST /api/projects` | Create a project. |
+| `GET /api/projects` | List projects. |
+| `GET /api/projects/{id}` | Get a project. |
+| `PATCH /api/projects/{id}` | Update project status. |
+| `GET /api/projects/{id}/status` | Project counts and progress. |
+| `GET /api/projects/{id}/dag` | Task graph nodes and edges. |
+| `GET /api/projects/{id}/overview` | Summary, ready IDs, tasks, and edges. |
+| `POST /api/projects/{project_id}/tasks` | Create a task. |
+| `GET /api/projects/{project_id}/tasks` | List tasks. |
+| `POST /api/projects/{project_id}/tasks/batch` | Batch-create tasks. |
+| `GET /api/projects/{project_id}/events` | List events. |
+| `POST /api/go` | Claim and start next task. |
+| `POST /api/tasks/next` | Get or claim the next ready task. |
+| `GET /api/tasks/{id}` | Get a task. |
+| `PATCH /api/tasks/{id}` | Update task fields. |
+| `GET /api/tasks/{id}/context` | Task, project, upstream artifacts, downstream tasks, siblings. |
+| `POST /api/tasks/{id}/claim` | Claim a task. |
+| `POST /api/tasks/{id}/start` | Start a claimed task. |
+| `POST /api/tasks/{id}/heartbeat` | Update heartbeat. |
+| `POST /api/tasks/{id}/progress` | Update progress. |
+| `POST /api/tasks/{id}/done` | Complete a task. |
+| `POST /api/tasks/{id}/pause` | Pause a task. |
+| `POST /api/tasks/{id}/fail` | Fail a task. |
+| `POST /api/tasks/{id}/cancel` | Cancel a task. |
+| `POST /api/tasks/{id}/approve` | Approve a task. |
+| `POST /api/tasks/{id}/notes` | Add a note. |
+| `GET /api/tasks/{id}/notes` | List notes. |
+| `POST /api/tasks/{id}/deps` | Add a dependency. |
+| `DELETE /api/tasks/{id}/deps` | Remove a dependency. |
+| `POST /api/tasks/{id}/decompose` | Decompose into subtasks. |
+| `POST /api/tasks/{id}/replan` | Replan subtasks. |
+| `POST /api/tasks/{id}/amend` | Prepend context to a task. |
+| `POST /api/tasks/{id}/pivot` | Replace a subtree. |
+| `POST /api/tasks/{id}/split` | Split a task. |
+| `POST /api/tasks/{task_id}/artifacts` | Create an artifact. |
+| `GET /api/tasks/{task_id}/artifacts` | List artifacts. |
+| `GET /api/tasks/{task_id}/upstream-artifacts` | List artifacts from upstream tasks. |
+| `GET /api/artifacts/{id}` | Get an artifact. |
+| `GET /api/ahead?project=...&depth=2` | Look ahead in the graph. |
+| `POST /api/what-if` | Dry-run a graph mutation. |
+| `GET /api/events/stream` | Server-sent event stream. |
+
+## Batch YAML
+
+Create multiple top-level tasks:
+
+```yaml
+tasks:
+  - id: design
+    title: "Design auth schema"
+    kind: research
+    priority: 10
+    tags: [auth, backend]
+  - id: implement
+    title: "Implement auth endpoints"
+    kind: code
+    deps:
+      - from: design
+        kind: feeds_into
+  - title: "Review auth implementation"
+    kind: review
+    deps:
+      - from: implement
+        kind: blocks
+```
+
+Load it:
+
+```sh
+taskgraph task create-batch --file tasks.yaml
 ```
 
 ## Configuration
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--db <PATH>` | `.taskgraph.db` | Database file path |
-| `TASKGRAPH_DB` | — | Database path (env var) |
-| `RUST_LOG` | — | Log level (`info`, `debug`) |
-| `--json` | — | Structured JSON output |
-| `-c, --compact` | — | Token-efficient output for LLMs |
+| Setting | Default | Description |
+| --- | --- | --- |
+| `--db <PATH>` | `.taskgraph.db` | Database path for this command. |
+| `TASKGRAPH_DB` | unset | Database path used when `--db` is omitted. |
+| `RUST_LOG` | unset | Logging filter, for example `info` or `debug`. |
+| `NO_COLOR` | unset | Disable colored terminal output when set. |
+| `INSTALL_DIR` | `/usr/local/bin` | Install location used by `install.sh`. |
+
+## Operational notes
+
+- The SQLite database is the source of truth. You can copy, back up, or inspect
+  `.taskgraph.db` directly.
+- WAL mode is enabled so readers can continue while another process writes.
+- Atomic claims rely on SQLite write serialization.
+- `taskgraph serve` runs a periodic sweeper. CLI and MCP stdio operations also
+  promote ready tasks after task creation and completion.
+- Use `--json -c` when an LLM will consume the output.
+- Use `taskgraph prompt --for cli` or `taskgraph prompt --for mcp` to generate
+  agent instructions that match the installed binary.
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for design details including the task state machine, dependency engine, handoff protocol, and why SQLite.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed design: state
+machine, dependency engine, handoff protocol, event system, and SQLite trade-offs.
 
 ## License
 
