@@ -8,10 +8,12 @@ use crate::db::{
     add_dependency, add_note, add_task_files, amend_task_description, check_file_conflicts,
     claim_next_task, claim_task, complete_task, compute_effects, create_artifact, create_project,
     create_task, fail_task, get_artifact, get_downstream_tasks, get_handoff_context, get_lookahead,
-    get_project, get_task, get_upstream_artifacts, insert_task_between, list_artifacts,
-    list_dependencies, list_due_wakes, list_notes, list_tasks, parse_sleep_duration_ms, pause_task,
-    pivot_subtree, project_state, promote_ready_tasks, remove_dependency, resume_task, run_sweep,
-    sleep_task, snapshot_task_statuses, split_task, start_task, update_task, Database, NewSubtask,
+    get_process_logs, get_process_run, get_project, get_task, get_upstream_artifacts,
+    insert_task_between, launch_process_run, list_artifacts, list_dependencies, list_due_wakes,
+    list_notes, list_process_runs, list_tasks, parse_sleep_duration_ms, pause_task, pivot_subtree,
+    project_state, promote_ready_tasks, remove_dependency, request_process_kill, resume_task,
+    run_sweep, sleep_task, snapshot_task_statuses, spawn_process_runner, split_task, start_task,
+    update_task, Database, NewSubtask, ProcessHookSpec, ProcessLaunchRequest, ProcessRunFilters,
     SplitPart, TaskListFilters,
 };
 use crate::models::{
@@ -158,6 +160,33 @@ struct TaskResumeArgs {
 #[derive(Debug, Deserialize)]
 struct DueWakesArgs {
     project_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessLaunchArgs {
+    task_id: String,
+    agent_id: String,
+    command: Vec<String>,
+    cwd: Option<String>,
+    hooks: Option<Vec<ProcessHookSpec>>,
+    callback_url: Option<String>,
+    state_ref: Option<Value>,
+    idle_timeout: Option<String>,
+    timeout: Option<String>,
+    idle_timeout_ms: Option<i64>,
+    timeout_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessGetArgs {
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProcessListArgs {
+    project_id: Option<String>,
+    task_id: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -685,6 +714,89 @@ pub fn tool_schemas() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "taskgraph_process_launch",
+            "description": "Launch and observe a process for an owned task; wakes/calls back on hook, exit, kill, or stuck",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": { "type": "string" },
+                    "agent_id": { "type": "string" },
+                    "command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "argv array, for example [\"python\", \"download.py\"]"
+                    },
+                    "cwd": { "type": "string" },
+                    "hooks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "stream": { "type": "string", "description": "any, stdout, or stderr" },
+                                "pattern": { "type": "string" }
+                            },
+                            "required": ["name", "pattern"]
+                        }
+                    },
+                    "callback_url": { "type": "string" },
+                    "state_ref": {
+                        "description": "Opaque JSON state reference returned on resume"
+                    },
+                    "idle_timeout": { "type": "string", "description": "3000 (ms), 3s, 5m, 1h" },
+                    "timeout": { "type": "string", "description": "3000 (ms), 3s, 5m, 1h" },
+                    "idle_timeout_ms": { "type": "integer" },
+                    "timeout_ms": { "type": "integer" }
+                },
+                "required": ["task_id", "agent_id", "command"]
+            }
+        }),
+        json!({
+            "name": "taskgraph_process_get",
+            "description": "Get process run status",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"]
+            }
+        }),
+        json!({
+            "name": "taskgraph_process_list",
+            "description": "List process runs",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": { "type": "string" },
+                    "task_id": { "type": "string" },
+                    "status": { "type": "string" }
+                }
+            }
+        }),
+        json!({
+            "name": "taskgraph_process_kill",
+            "description": "Request termination of a running process",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"]
+            }
+        }),
+        json!({
+            "name": "taskgraph_process_logs",
+            "description": "Read captured stdout/stderr logs for a process run",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run_id": { "type": "string" }
+                },
+                "required": ["run_id"]
+            }
+        }),
+        json!({
             "name": "taskgraph_task_replan",
             "description": "Cancel remaining subtasks and create replacement subtasks",
             "inputSchema": {
@@ -860,6 +972,11 @@ pub fn call_tool(db: &Database, tool_name: &str, args: Value) -> ToolHandlerResu
         "taskgraph_task_sleep" => taskgraph_task_sleep(db, args),
         "taskgraph_task_resume" => taskgraph_task_resume(db, args),
         "taskgraph_wakes_due" => taskgraph_wakes_due(db, args),
+        "taskgraph_process_launch" => taskgraph_process_launch(db, args),
+        "taskgraph_process_get" => taskgraph_process_get(db, args),
+        "taskgraph_process_list" => taskgraph_process_list(db, args),
+        "taskgraph_process_kill" => taskgraph_process_kill(db, args),
+        "taskgraph_process_logs" => taskgraph_process_logs(db, args),
         "taskgraph_task_replan" => taskgraph_task_replan(db, args),
         "taskgraph_what_if" => taskgraph_what_if(db, args),
         "taskgraph_task_insert" => taskgraph_task_insert(db, args),
@@ -1736,6 +1853,87 @@ fn taskgraph_wakes_due(db: &Database, args: Value) -> ToolHandlerResult {
     let args: DueWakesArgs = serde_json::from_value(args)?;
     let wakes = list_due_wakes(db, args.project_id.as_deref())?;
     Ok(serde_json::to_value(wakes)?)
+}
+
+fn taskgraph_process_launch(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: ProcessLaunchArgs = serde_json::from_value(args)?;
+    let idle_timeout_ms =
+        parse_process_duration(args.idle_timeout, args.idle_timeout_ms, "idle_timeout")?;
+    let timeout_ms = parse_process_duration(args.timeout, args.timeout_ms, "timeout")?;
+    let result = launch_process_run(
+        db,
+        ProcessLaunchRequest {
+            task_id: args.task_id,
+            agent_id: args.agent_id,
+            command: args.command,
+            cwd: args.cwd,
+            hooks: args.hooks.unwrap_or_default(),
+            callback_url: args.callback_url,
+            state_ref: args.state_ref,
+            idle_timeout_ms,
+            timeout_ms,
+        },
+    )?;
+    if let Err(err) = spawn_process_runner(db, &result.run.id) {
+        let _ = crate::db::mark_process_terminal(
+            db,
+            &result.run.id,
+            "failed",
+            None,
+            None,
+            &format!("runner_spawn_error:{err}"),
+        );
+        return Err(err);
+    }
+    Ok(serde_json::to_value(result)?)
+}
+
+fn taskgraph_process_get(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: ProcessGetArgs = serde_json::from_value(args)?;
+    Ok(serde_json::to_value(get_process_run(db, &args.run_id)?)?)
+}
+
+fn taskgraph_process_list(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: ProcessListArgs = serde_json::from_value(args)?;
+    let runs = list_process_runs(
+        db,
+        ProcessRunFilters {
+            project_id: args.project_id,
+            task_id: args.task_id,
+            status: args.status,
+        },
+    )?;
+    Ok(serde_json::to_value(runs)?)
+}
+
+fn taskgraph_process_kill(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: ProcessGetArgs = serde_json::from_value(args)?;
+    Ok(serde_json::to_value(request_process_kill(
+        db,
+        &args.run_id,
+    )?)?)
+}
+
+fn taskgraph_process_logs(db: &Database, args: Value) -> ToolHandlerResult {
+    let args: ProcessGetArgs = serde_json::from_value(args)?;
+    Ok(serde_json::to_value(get_process_logs(db, &args.run_id)?)?)
+}
+
+fn parse_process_duration(
+    text: Option<String>,
+    explicit_ms: Option<i64>,
+    field: &str,
+) -> Result<Option<i64>> {
+    if let Some(value) = explicit_ms {
+        if value <= 0 {
+            return Err(anyhow!("{field}_ms must be positive"));
+        }
+        return Ok(Some(value));
+    }
+    text.map(|raw| {
+        parse_sleep_duration_ms(&raw).map_err(|e| anyhow!("invalid {field} duration '{raw}': {e}"))
+    })
+    .transpose()
 }
 
 fn taskgraph_what_if(db: &Database, args: Value) -> ToolHandlerResult {

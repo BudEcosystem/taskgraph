@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod events;
+pub mod process;
 pub mod project;
 pub mod task;
 
@@ -96,6 +97,8 @@ pub enum Commands {
     WhatIf(task::WhatIfCommand),
     #[command(about = "Attach/read artifacts (files, outputs) on tasks")]
     Artifact(artifact::ArtifactCommand),
+    #[command(about = "Launch and observe external processes for owned tasks")]
+    Process(process::ProcessCommand),
     #[command(about = "List or watch project events in real-time")]
     Events(events::EventsCommand),
     #[command(about = "Inspect durable sleep wakeups")]
@@ -189,6 +192,17 @@ pub enum Commands {
     Serve {
         #[arg(long, short, default_value = "8484", help = "Port to listen on")]
         port: u16,
+        #[arg(
+            long = "enable-process-launch",
+            default_value_t = false,
+            help = "Allow HTTP clients to launch local processes"
+        )]
+        enable_process_launch: bool,
+    },
+    #[command(hide = true, about = "Internal process runner")]
+    ProcessRunner {
+        #[arg(long)]
+        run_id: String,
     },
     #[command(
         about = "Generate integration prompt/config for your agent platform.\n\n\
@@ -211,6 +225,7 @@ pub fn run(db: &Database, command: Commands, json: bool, compact: bool) -> Resul
         Commands::Task(command) => task::run(db, command, json, compact),
         Commands::WhatIf(command) => task::run_what_if(db, command, json, compact),
         Commands::Artifact(command) => artifact::run(db, command, json),
+        Commands::Process(command) => process::run(db, command, json, compact),
         Commands::Events(command) => events::run(db, command, json),
         Commands::Wakes(command) => task::run_wakes(db, command, json),
         Commands::Ahead { depth, project } => task::ahead_cmd(db, project, depth, json, compact),
@@ -302,7 +317,10 @@ pub fn run(db: &Database, command: Commands, json: bool, compact: bool) -> Resul
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Commands::Mcp | Commands::Serve { .. } | Commands::Prompt { .. } => {
+        Commands::Mcp
+        | Commands::Serve { .. }
+        | Commands::ProcessRunner { .. }
+        | Commands::Prompt { .. } => {
             unreachable!("handled in main")
         }
     }

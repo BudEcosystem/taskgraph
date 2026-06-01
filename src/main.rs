@@ -13,10 +13,22 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Serve { port }) => {
+        Some(Commands::Serve {
+            port,
+            enable_process_launch,
+        }) => {
             let db_path = cli.db.clone();
+            if enable_process_launch {
+                std::env::set_var("TASKGRAPH_ENABLE_PROCESS_LAUNCH", "1");
+            }
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             if let Err(err) = rt.block_on(taskgraph::server::run_server(&db_path, port)) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::ProcessRunner { run_id }) => {
+            if let Err(err) = taskgraph::process_runner::run_process_runner(&cli.db, &run_id) {
                 eprintln!("error: {err}");
                 std::process::exit(1);
             }
@@ -118,9 +130,10 @@ prerequisites are complete.
 2. Add tasks with dependencies — each task declares which tasks must finish first
 3. Claim work: `taskgraph_go` returns the next ready task with handoff context from completed upstream tasks
 4. Sleep when waiting: `taskgraph_task_sleep` stores a resume state ref and releases the agent until a wake time
-5. Resume when due: `taskgraph_wakes_due` or `task_wake_due` identifies due sleeps, then `taskgraph_task_resume` returns the saved state ref
-6. Complete + advance: `taskgraph_done` marks complete, `taskgraph_go` gets the next one
-7. Check progress: `taskgraph_status` shows done/total/ready/running/sleeping counts
+5. Observe processes: `taskgraph_process_launch` launches a child process and wakes/calls back on hook, exit, kill, or stuck
+6. Resume when due: `taskgraph_wakes_due` or `task_wake_due` identifies due sleeps/process waits, then `taskgraph_task_resume` returns the saved state ref
+7. Complete + advance: `taskgraph_done` marks complete, `taskgraph_go` gets the next one
+8. Check progress: `taskgraph_status` shows done/total/ready/running/sleeping counts
 
 ### Plan Adaptation (mid-flight)
 - `taskgraph_task_insert` — add a missed step between existing tasks
@@ -133,6 +146,7 @@ prerequisites are complete.
 - Dependency types: `feeds_into` (default), `blocks`, `suggests`
 - Task kinds: `generic`, `code`, `research`, `review`, `test`, `shell`
 - Durable sleep: agents can sleep owned work with an opaque `state_ref`; taskgraph keeps the current `agent_id` and emits `task_wake_due`
+- Process observation: `taskgraph_process_launch` creates a durable wait and observes stdout/stderr hooks plus terminal process states
 - IDs are short 8-char strings (e.g. `t-a1b2c3d4`)
 - Fuzzy matching: misspell a task ID and taskgraph suggests the closest match
 - Use `--compact` flag on tools for token-efficient output"#
@@ -208,6 +222,21 @@ taskgraph wakes due
 taskgraph resume t-TASKID --agent my-agent --sleep-id s-a1b2c3
 ```
 
+### Process Observation
+```bash
+# Launch a child process, save the task as sleeping, and wake on hook/exit/killed/stuck.
+taskgraph process launch t-TASKID --agent my-agent \
+  --hook ready=stdout:READY \
+  --callback http://127.0.0.1:9000/taskgraph \
+  --state-ref '{{"checkpoint":"download-42"}}' \
+  -- python download_model.py
+
+taskgraph wakes due
+taskgraph resume t-TASKID --agent my-agent --sleep-id w-a1b2c3
+taskgraph process get r-a1b2c3
+taskgraph process logs r-a1b2c3
+```
+
 ### Checking Status
 ```bash
 taskgraph status                   # One-line: "5/12 done (42%) | ready: t-xx,t-yy | running: t-zz@agent-1"
@@ -264,6 +293,7 @@ taskgraph task notes t-abc123
 - **Output modes**: human default, `--json` for structured, `-c`/`--compact` for token-efficient
 - **Handoff protocol**: when you complete a task with --result, that data is available to the agent working on downstream tasks via `taskgraph go`
 - **Sleep protocol**: when waiting, `taskgraph sleep` stores an opaque state reference and keeps the current `agent_id`; after the wake time, `taskgraph resume` returns that state to the same logical agent
+- **Process protocol**: `taskgraph process launch` starts a detached observer that records hooks, exit/killed/stuck states, captured logs, and optional callbacks; resume still uses the wait id as `--sleep-id`
 - **Effect analysis**: insert/pivot/split responses include which tasks got delayed/accelerated/unblocked
 
 ### Multi-Agent Pattern
@@ -310,6 +340,11 @@ WORK LOOP:
   POST   /tasks/:id/sleep            Durable sleep. Body: {{"duration": "3000", "state_ref": {{"checkpoint": "..."}}, "reason": "..."}}
   GET    /wakes/due?project=X        List sleeping tasks whose wake time has arrived
   POST   /tasks/:id/resume           Resume sleeping task. Body: {{"agent_id": "...", "sleep_id": "..."}}
+  POST   /tasks/:id/processes        Launch observed process. Requires server --enable-process-launch.
+                                     Body: {{"agent_id": "...", "command": ["python", "download.py"], "hooks": [{{"name":"ready","stream":"stdout","pattern":"READY"}}], "callback_url": "..."}}
+  GET    /processes/:id              Get process run status
+  POST   /processes/:id/kill         Request process termination
+  GET    /processes/:id/logs         Read captured stdout/stderr
   POST   /tasks/:id/done             Complete task. Body: {{"result": ..., "files": ["src/x.rs"]}}
   POST   /tasks/:id/fail             Fail task. Body: {{"error": "..."}}
   POST   /tasks/:id/claim            Claim specific task. Body: {{"agent_id": "..."}}
@@ -342,6 +377,7 @@ EVENTS (real-time):
 - POST /tasks/:id/sleep stores an opaque state_ref and keeps the current agent_id
 - task_wake_due events and /wakes/due tell a harness when to restart/resume the same logical agent
 - POST /tasks/:id/resume is rejected until the sleeping task's wake time is due
+- POST /tasks/:id/processes observes a launched process and wakes/calls back on hook, exit, kill, or stuck
 - POST /tasks/:id/done with result data enables handoff to downstream tasks"#
     );
 }

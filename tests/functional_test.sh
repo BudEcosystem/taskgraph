@@ -6,10 +6,15 @@ DB="/tmp/taskgraph-functional-test.db"
 PASS=0
 FAIL=0
 ERRORS=""
+CALLBACK_PID=""
 
 cleanup() {
-  rm -f "$DB" "$DB-wal" "$DB-shm" /tmp/taskgraph-batch-test.yaml /tmp/taskgraph-replan-test.yaml
+  if [ -n "${CALLBACK_PID:-}" ]; then
+    kill "$CALLBACK_PID" 2>/dev/null || true
+  fi
+  rm -f "$DB" "$DB-wal" "$DB-shm" /tmp/taskgraph-batch-test.yaml /tmp/taskgraph-replan-test.yaml /tmp/taskgraph-callback-port /tmp/taskgraph-callback.json
 }
+trap cleanup EXIT
 
 assert_eq() {
   local label="$1" expected="$2" actual="$3"
@@ -579,7 +584,107 @@ $TASKGRAPH --db "$DB" --json task done "$SLEEP_TASK_ID" --result '{"summary":"re
 echo ""
 
 # ─────────────────────────────────────────────
-echo "19. VERSION & HELP"
+echo "19. PROCESS OBSERVATION"
+echo "─────────────────────────────────────────"
+
+CALLBACK_FILE=/tmp/taskgraph-callback.json
+CALLBACK_PORT_FILE=/tmp/taskgraph-callback-port
+rm -f "$CALLBACK_FILE" "$CALLBACK_PORT_FILE"
+python3 - "$CALLBACK_PORT_FILE" "$CALLBACK_FILE" <<'PY' &
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
+
+port_file, callback_file = sys.argv[1], sys.argv[2]
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        with open(callback_file, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as fh:
+    fh.write(str(server.server_port))
+server.handle_request()
+PY
+CALLBACK_PID=$!
+
+for _ in $(seq 1 30); do
+  [ -s "$CALLBACK_PORT_FILE" ] && break
+  sleep 0.1
+done
+CALLBACK_PORT=$(cat "$CALLBACK_PORT_FILE")
+
+PROC_TASK=$($TASKGRAPH --db "$DB" --json task create --project "$PROJ_ID" --title "Process Task")
+PROC_TASK_ID=$(jq_field "$PROC_TASK" "id")
+$TASKGRAPH --db "$DB" --json task claim "$PROC_TASK_ID" --agent proc-agent >/dev/null
+$TASKGRAPH --db "$DB" --json task start "$PROC_TASK_ID" >/dev/null
+
+PROC_OUT=$($TASKGRAPH --db "$DB" --json -c process launch "$PROC_TASK_ID" \
+  --agent proc-agent \
+  --hook model_ready=stdout:MODEL_READY \
+  --callback "http://127.0.0.1:$CALLBACK_PORT/taskgraph" \
+  --state-ref '{"job":"hf-download"}' \
+  -- sh -c 'sleep 0.4; echo MODEL_READY; sleep 0.2; echo DONE')
+PROC_RUN_ID=$(jq_field "$PROC_OUT" "run_id")
+PROC_WAIT_ID=$(jq_field "$PROC_OUT" "wait_id")
+assert_regex "process run id uses short format" '^r-[a-z0-9]{6}$' "$PROC_RUN_ID"
+assert_regex "process wait id uses short format" '^w-[a-z0-9]{6}$' "$PROC_WAIT_ID"
+assert_eq "process launch returns sleep id" "$PROC_WAIT_ID" "$(jq_field "$PROC_OUT" "sleep_id")"
+
+PROC_TASK_SLEEPING=$($TASKGRAPH --db "$DB" --json task get "$PROC_TASK_ID")
+assert_eq "process launch marks task sleeping" "sleeping" "$(jq_field "$PROC_TASK_SLEEPING" "status")"
+
+PROC_EARLY_RESUME=$($TASKGRAPH --db "$DB" --json -c resume "$PROC_TASK_ID" --agent proc-agent --sleep-id "$PROC_WAIT_ID" 2>&1 || true)
+assert_contains "process early resume rejected" "not due until" "$PROC_EARLY_RESUME"
+
+PROC_DUE="[]"
+for _ in $(seq 1 30); do
+  PROC_DUE=$($TASKGRAPH --db "$DB" --json wakes due --project "$PROJ_ID")
+  [ "$(jq_len "$PROC_DUE")" = "1" ] && break
+  sleep 0.1
+done
+assert_eq "process hook makes wake due" "1" "$(jq_len "$PROC_DUE")"
+assert_eq "process due wake uses wait id" "$PROC_WAIT_ID" "$(jq_field_at "$PROC_DUE" 0 "sleep_id")"
+assert_eq "process due wake has state ref" "hf-download" "$(echo "$PROC_DUE" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['state_ref']['state_ref']['job'])")"
+
+for _ in $(seq 1 30); do
+  [ -s "$CALLBACK_FILE" ] && break
+  sleep 0.1
+done
+CALLBACK_BODY=$(cat "$CALLBACK_FILE" 2>/dev/null || true)
+assert_contains "process callback includes hook event" "process_hook_matched" "$CALLBACK_BODY"
+assert_contains "process callback includes run id" "$PROC_RUN_ID" "$CALLBACK_BODY"
+
+PROC_RESUME=$($TASKGRAPH --db "$DB" --json -c resume "$PROC_TASK_ID" --agent proc-agent --sleep-id "$PROC_WAIT_ID")
+assert_eq "process resume returns running" "running" "$(jq_field "$PROC_RESUME" "status")"
+assert_eq "process resume returns state ref" "hf-download" "$(echo "$PROC_RESUME" | python3 -c "import sys,json; print(json.load(sys.stdin)['state_ref']['state_ref']['job'])")"
+
+PROC_STATUS=""
+for _ in $(seq 1 30); do
+  PROC_GET=$($TASKGRAPH --db "$DB" --json process get "$PROC_RUN_ID")
+  PROC_STATUS=$(jq_field "$PROC_GET" "status")
+  [ "$PROC_STATUS" = "succeeded" ] && break
+  sleep 0.1
+done
+assert_eq "process eventually succeeds" "succeeded" "$PROC_STATUS"
+
+PROC_LOGS=$($TASKGRAPH --db "$DB" --json process logs "$PROC_RUN_ID")
+assert_contains "process logs include hook output" "MODEL_READY" "$PROC_LOGS"
+assert_contains "process logs include done output" "DONE" "$PROC_LOGS"
+
+$TASKGRAPH --db "$DB" --json task done "$PROC_TASK_ID" --result '{"summary":"process observed"}' >/dev/null
+
+echo ""
+
+# ─────────────────────────────────────────────
+echo "20. VERSION & HELP"
 echo "─────────────────────────────────────────"
 
 VERSION=$($TASKGRAPH --version)
@@ -594,7 +699,7 @@ assert_contains "help shows serve" "serve" "$HELP"
 echo ""
 
 # ─────────────────────────────────────────────
-echo "20. JIT ADAPTIVE PLANNING PRIMITIVES"
+echo "21. JIT ADAPTIVE PLANNING PRIMITIVES"
 echo "─────────────────────────────────────────"
 
 JIT_PROJECT=$($TASKGRAPH --db "$DB" --json project create "jit-project")

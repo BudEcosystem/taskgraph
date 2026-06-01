@@ -957,6 +957,21 @@ pub fn resume_task(
         ))
         .into());
     }
+    if let Some(wait_id) = previous_sleep_id.as_deref() {
+        let _ = conn.execute(
+            r#"
+            UPDATE task_waits
+            SET status = 'resumed',
+                resumed_at = ?4,
+                updated_at = ?4
+            WHERE id = ?1
+              AND task_id = ?2
+              AND agent_id = ?3
+              AND status = 'due';
+            "#,
+            params![wait_id, task_id, agent_id, sleep_dt_to_sql(now)],
+        );
+    }
     drop(conn);
     let task = get_task(db, task_id)?;
     let _ = crate::db::insert_event(

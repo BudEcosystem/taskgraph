@@ -132,6 +132,86 @@ CREATE TABLE IF NOT EXISTS task_files (
 );
 "#;
 
+const CREATE_PROCESS_RUNS: &str = r#"
+CREATE TABLE IF NOT EXISTS process_runs (
+  id                 TEXT PRIMARY KEY,
+  task_id            TEXT NOT NULL REFERENCES tasks(id),
+  project_id         TEXT NOT NULL REFERENCES projects(id),
+  agent_id           TEXT NOT NULL,
+  wait_id            TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'created',
+  command            JSON NOT NULL,
+  cwd                TEXT,
+  pid                INTEGER,
+  runner_pid         INTEGER,
+  started_at         DATETIME,
+  ended_at           DATETIME,
+  last_heartbeat_at  DATETIME,
+  last_output_at     DATETIME,
+  exit_code          INTEGER,
+  exit_signal        INTEGER,
+  terminal_reason    TEXT,
+  hook_name          TEXT,
+  hook_signal        TEXT,
+  stdout_path        TEXT,
+  stderr_path        TEXT,
+  callback_url       TEXT,
+  state_ref          JSON,
+  idle_timeout_ms    INTEGER,
+  timeout_ms         INTEGER,
+  created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+const CREATE_PROCESS_HOOKS: &str = r#"
+CREATE TABLE IF NOT EXISTS process_hooks (
+  id          TEXT PRIMARY KEY,
+  run_id      TEXT NOT NULL REFERENCES process_runs(id),
+  name        TEXT NOT NULL,
+  stream      TEXT NOT NULL DEFAULT 'any',
+  pattern     TEXT NOT NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+const CREATE_TASK_WAITS: &str = r#"
+CREATE TABLE IF NOT EXISTS task_waits (
+  id          TEXT PRIMARY KEY,
+  task_id     TEXT NOT NULL REFERENCES tasks(id),
+  project_id  TEXT NOT NULL REFERENCES projects(id),
+  agent_id    TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  source_id   TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'waiting',
+  state_ref   JSON,
+  due_reason  TEXT,
+  due_at      DATETIME,
+  resumed_at  DATETIME,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+const CREATE_NOTIFICATION_OUTBOX: &str = r#"
+CREATE TABLE IF NOT EXISTS notification_outbox (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id        INTEGER NOT NULL REFERENCES events(id),
+  run_id          TEXT,
+  task_id         TEXT,
+  project_id      TEXT,
+  agent_id        TEXT,
+  target_url      TEXT NOT NULL,
+  payload         JSON NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_error      TEXT,
+  created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
 const INDEX_TASKS_PROJECT_STATUS: &str =
     "CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status);";
 const INDEX_TASKS_PARENT: &str =
@@ -153,6 +233,18 @@ const INDEX_PROJECTS_USER: &str =
     "CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);";
 const INDEX_TASKS_SLEEP_UNTIL: &str =
     "CREATE INDEX IF NOT EXISTS idx_tasks_sleep_until ON tasks(status, sleep_until, wake_emitted_at);";
+const INDEX_PROCESS_RUNS_TASK: &str =
+    "CREATE INDEX IF NOT EXISTS idx_process_runs_task ON process_runs(task_id, status);";
+const INDEX_PROCESS_RUNS_WAIT: &str =
+    "CREATE INDEX IF NOT EXISTS idx_process_runs_wait ON process_runs(wait_id);";
+const INDEX_PROCESS_HOOKS_RUN: &str =
+    "CREATE INDEX IF NOT EXISTS idx_process_hooks_run ON process_hooks(run_id);";
+const INDEX_TASK_WAITS_TASK: &str =
+    "CREATE INDEX IF NOT EXISTS idx_task_waits_task ON task_waits(task_id, status);";
+const INDEX_TASK_WAITS_SOURCE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_task_waits_source ON task_waits(kind, source_id, status);";
+const INDEX_NOTIFICATION_OUTBOX_DUE: &str =
+    "CREATE INDEX IF NOT EXISTS idx_notification_outbox_due ON notification_outbox(status, next_attempt_at);";
 
 const CREATE_TASK_READINESS_VIEW: &str = r#"
 CREATE VIEW IF NOT EXISTS task_readiness AS
@@ -191,6 +283,10 @@ pub fn init_db(path: &str) -> Result<Database> {
     conn.execute_batch(CREATE_TASKGRAPH_META)?;
     conn.execute_batch(CREATE_TASK_NOTES)?;
     conn.execute_batch(CREATE_TASK_FILES)?;
+    conn.execute_batch(CREATE_PROCESS_RUNS)?;
+    conn.execute_batch(CREATE_PROCESS_HOOKS)?;
+    conn.execute_batch(CREATE_TASK_WAITS)?;
+    conn.execute_batch(CREATE_NOTIFICATION_OUTBOX)?;
     conn.execute_batch(INDEX_TASKS_PROJECT_STATUS)?;
     conn.execute_batch(INDEX_TASKS_PARENT)?;
     conn.execute_batch(INDEX_DEPS_FROM)?;
@@ -206,9 +302,15 @@ pub fn init_db(path: &str) -> Result<Database> {
     let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_reason TEXT;");
     let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN wake_emitted_at DATETIME;");
     conn.execute_batch(INDEX_TASKS_SLEEP_UNTIL)?;
+    conn.execute_batch(INDEX_PROCESS_RUNS_TASK)?;
+    conn.execute_batch(INDEX_PROCESS_RUNS_WAIT)?;
+    conn.execute_batch(INDEX_PROCESS_HOOKS_RUN)?;
+    conn.execute_batch(INDEX_TASK_WAITS_TASK)?;
+    conn.execute_batch(INDEX_TASK_WAITS_SOURCE)?;
+    conn.execute_batch(INDEX_NOTIFICATION_OUTBOX_DUE)?;
     // Migration: add user_id column for existing databases (must run before index)
     let _ = conn.execute_batch("ALTER TABLE projects ADD COLUMN user_id TEXT;");
     conn.execute_batch(INDEX_PROJECTS_USER)?;
     conn.execute_batch(CREATE_TASK_READINESS_VIEW)?;
-    Ok(Database::from_connection(conn))
+    Ok(Database::from_connection_with_path(conn, path.to_string()))
 }

@@ -259,6 +259,204 @@ fn sleep_resume_round_trip_returns_state_ref() {
 }
 
 #[test]
+fn process_launch_enters_sleeping_wait_and_blocks_early_resume() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessWait", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "download model", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo ready".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: Some(json!({"checkpoint": "download-1"})),
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(launched.run.status, "created");
+    assert_eq!(launched.run.task_id, task.id);
+    assert_eq!(launched.wait.kind, "process");
+    assert_eq!(launched.wait.status, "waiting");
+
+    let sleeping = get_task(&db, &task.id).unwrap();
+    assert_eq!(sleeping.status, TaskStatus::Sleeping);
+    assert_eq!(sleeping.agent_id.as_deref(), Some("agent-a"));
+    assert_eq!(
+        sleeping.sleep_id.as_deref(),
+        Some(launched.wait.id.as_str())
+    );
+    assert_eq!(
+        sleeping.sleep_state_ref.as_ref().unwrap()["run_id"],
+        launched.run.id
+    );
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert!(due.is_empty());
+
+    let early = resume_task(&db, &task.id, "agent-a", Some(&launched.wait.id)).unwrap_err();
+    assert!(early.to_string().contains("not due until"));
+}
+
+#[test]
+fn process_terminal_marks_wait_due_and_resume_returns_state() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessDone", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "download model", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo done".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: Some(json!({"checkpoint": "download-2"})),
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        123,
+        456,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+    let terminal =
+        mark_process_terminal(&db, &launched.run.id, "succeeded", Some(0), None, "exit").unwrap();
+    assert_eq!(terminal.status, "succeeded");
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].task_id, task.id);
+    assert_eq!(due[0].sleep_id, launched.wait.id);
+    assert_eq!(
+        due[0].state_ref.as_ref().unwrap()["state_ref"]["checkpoint"],
+        "download-2"
+    );
+
+    let resumed = resume_task(&db, &task.id, "agent-a", Some(&launched.wait.id)).unwrap();
+    assert_eq!(resumed.task.status, TaskStatus::Running);
+    assert_eq!(resumed.sleep_id.as_deref(), Some(launched.wait.id.as_str()));
+    assert_eq!(
+        resumed.state_ref.as_ref().unwrap()["state_ref"]["checkpoint"],
+        "download-2"
+    );
+}
+
+#[test]
+fn process_hook_marks_wait_due_once() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessHook", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "download model", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo READY".to_string()],
+            cwd: None,
+            hooks: vec![ProcessHookSpec {
+                name: "model_ready".to_string(),
+                stream: "stdout".to_string(),
+                pattern: "READY".to_string(),
+            }],
+            callback_url: None,
+            state_ref: None,
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        123,
+        456,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+    mark_process_hook_matched(
+        &db,
+        &launched.run.id,
+        "model_ready",
+        "READY",
+        "stdout",
+        "READY",
+    )
+    .unwrap();
+    mark_process_hook_matched(
+        &db,
+        &launched.run.id,
+        "model_ready",
+        "READY",
+        "stdout",
+        "READY",
+    )
+    .unwrap();
+
+    let run = get_process_run(&db, &launched.run.id).unwrap();
+    assert_eq!(run.hook_name.as_deref(), Some("model_ready"));
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+
+    let wake_events = list_events(
+        &db,
+        EventFilters {
+            project_id: Some(project.id),
+            event_type: Some(EventType::TaskWakeDue),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(wake_events.len(), 1);
+}
+
+#[test]
 fn sleep_uses_millisecond_precision_for_due_checks() {
     let db_path = test_db_path();
     let db = init_db(&db_path).unwrap();

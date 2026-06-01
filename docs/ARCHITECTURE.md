@@ -303,8 +303,7 @@ sequenceDiagram
 The key design constraints are:
 
 - **No agent registration**: sleep uses the `agent_id` already attached by claim.
-  The agent does not register a worker, callback URL, process handle, or runtime
-  identity with taskgraph.
+  The agent does not register a worker or runtime identity with taskgraph.
 - **Opaque state**: `sleep_state_ref` is JSON, but taskgraph does not interpret
   it. Agents can store a checkpoint path, external job ID, URL, protocol payload,
   or any other compact resume token.
@@ -318,10 +317,62 @@ The key design constraints are:
   optimizes timing. If no server is running, `wakes_due` can still discover due
   tasks from the database.
 
-This deliberately stops before automatic invocation. Process restart, HTTP
-callbacks, queue publication, or framework-specific agent construction belong in
-the harness that understands the agent's protocol and runtime. taskgraph exposes
-the durable wake contract that those harnesses can consume.
+Process restart, queue publication, or framework-specific agent construction
+still belong in the harness that understands the agent's protocol and runtime.
+taskgraph exposes the durable wake contract that those harnesses can consume.
+
+---
+
+## Process Observation
+
+Some waits are not time based. An agent may start a model download, training
+process, compiler, benchmark, or tool invocation and then have nothing useful to
+do until the child process exits or prints a known signal. taskgraph handles that
+with a narrow process observer built on the sleep/wake primitive:
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant TG as taskgraph CLI/API
+    participant R as Detached Runner
+    participant P as Child Process
+    participant C as Callback Endpoint
+
+    A->>TG: process launch(task_id, agent_id, command, hooks, callback)
+    TG->>TG: process_run + task_wait saved<br/>task status = sleeping
+    TG->>R: spawn process-runner(run_id)
+    A-->>TG: exits
+    R->>P: spawn command
+    P-->>R: stdout/stderr/exit
+    R->>TG: hook or terminal state recorded in SQLite
+    TG->>TG: task_wait due<br/>task_wake_due event
+    TG->>C: at-least-once callback
+    A->>TG: resume(task_id, agent_id, wait_id)
+    TG-->>A: status = running<br/>process state_ref returned
+```
+
+The design constraints are:
+
+- **Task ownership is preserved**: `process launch` requires the task to be
+  `claimed` or `running` by the supplied `agent_id`, then moves it to
+  `sleeping` with the process `wait_id` as the `sleep_id`.
+- **SQLite is the process ledger**: `process_runs`, `process_hooks`,
+  `task_waits`, and `notification_outbox` hold the durable state. The detached
+  runner can reopen the database after the launching agent exits.
+- **The runner observes, not orchestrates agents**: it starts the child command,
+  captures stdout/stderr logs, scans configured hook patterns, records exit,
+  killed, and stuck states, and updates the wait. It does not reconstruct or run
+  the AI agent.
+- **Callbacks are outbox-backed**: process hook/terminal events enqueue HTTP
+  callbacks and retry them from SQLite. Delivery is at least once, so callback
+  endpoints must use the `Idempotency-Key` header.
+- **HTTP launch is opt-in**: REST process launch is disabled unless the server is
+  started with `--enable-process-launch`. CLI and MCP launches are local process
+  launches under the caller's account.
+
+This keeps taskgraph out of agent-framework territory while covering the common
+resource-saving case: an agent can launch work, die, and be called back when the
+external process reaches an observable state.
 
 ---
 
@@ -439,7 +490,11 @@ Events are emitted as **side-effects** of core operations, not as the source of 
 - **Events are optional**: If event emission fails, the primary operation still succeeds (`let _ =` in Rust)
 - **Events are for observability**: Dashboards, logs, SSE streams for monitoring — not for deriving state
 
-The event types map directly to lifecycle transitions: `task_created`, `task_ready`, `task_claimed`, `task_started`, `task_sleeping`, `task_wake_due`, `task_resumed`, `task_completed`, `task_failed`, `task_cancelled`.
+The event types map directly to lifecycle transitions: `task_created`,
+`task_ready`, `task_claimed`, `task_started`, `task_sleeping`, `task_wake_due`,
+`task_resumed`, `task_completed`, `task_failed`, `task_cancelled`,
+`process_started`, `process_hook_matched`, `process_exited`, `process_killed`,
+and `process_stuck`.
 
 ---
 
@@ -456,6 +511,10 @@ erDiagram
     tasks ||--o{ task_tags : tagged
     tasks ||--o{ artifacts : produces
     tasks ||--o{ events : emits
+    tasks ||--o{ process_runs : launches
+    tasks ||--o{ task_waits : waits
+    process_runs ||--o{ process_hooks : watches
+    process_runs ||--o{ notification_outbox : notifies
     
     projects {
         text id PK

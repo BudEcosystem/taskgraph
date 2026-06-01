@@ -51,6 +51,10 @@ pub fn api_routes() -> Router<AppState> {
         .route("/tasks/{id}/done", post(done_task_handler))
         .route("/tasks/{id}/sleep", post(sleep_task_handler))
         .route("/tasks/{id}/resume", post(resume_task_handler))
+        .route("/tasks/{id}/processes", post(process_launch_handler))
+        .route("/processes/{id}", get(process_get_handler))
+        .route("/processes/{id}/kill", post(process_kill_handler))
+        .route("/processes/{id}/logs", get(process_logs_handler))
         .route(
             "/tasks/{id}/notes",
             post(add_task_note_handler).get(list_task_notes_handler),
@@ -125,6 +129,14 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code: "conflict",
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
             message: message.into(),
         }
     }
@@ -278,6 +290,20 @@ pub struct SleepRequest {
 pub struct ResumeRequest {
     agent_id: String,
     sleep_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProcessLaunchRequestBody {
+    agent_id: String,
+    command: Vec<String>,
+    cwd: Option<String>,
+    hooks: Option<Vec<ProcessHookSpec>>,
+    callback_url: Option<String>,
+    state_ref: Option<Value>,
+    idle_timeout: Option<String>,
+    timeout: Option<String>,
+    idle_timeout_ms: Option<i64>,
+    timeout_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,6 +562,35 @@ fn emit_event(
         Utc::now().naive_utc(),
     )?;
     Ok(())
+}
+
+fn process_launch_enabled() -> bool {
+    matches!(
+        std::env::var("TASKGRAPH_ENABLE_PROCESS_LAUNCH")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn parse_optional_duration_ms(
+    text: Option<String>,
+    explicit_ms: Option<i64>,
+    field: &str,
+) -> Result<Option<i64>, ApiError> {
+    if let Some(value) = explicit_ms {
+        if value <= 0 {
+            return Err(ApiError::bad_request(format!(
+                "{field}_ms must be positive"
+            )));
+        }
+        return Ok(Some(value));
+    }
+    text.map(|raw| {
+        parse_sleep_duration_ms(&raw)
+            .map_err(|e| ApiError::bad_request(format!("invalid {field} '{raw}': {e}")))
+    })
+    .transpose()
 }
 
 fn go_response(db: &Database, project_id: &str, agent_id: &str) -> Result<Value, ApiError> {
@@ -1065,6 +1120,72 @@ pub async fn resume_task_handler(
     Ok(Json(
         serde_json::to_value(result).map_err(|e| ApiError::internal(e.to_string()))?,
     ))
+}
+
+pub async fn process_launch_handler(
+    State(db): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<ProcessLaunchRequestBody>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !process_launch_enabled() {
+        return Err(ApiError::forbidden(
+            "HTTP process launch is disabled; start server with --enable-process-launch",
+        ));
+    }
+    let idle_timeout_ms =
+        parse_optional_duration_ms(body.idle_timeout, body.idle_timeout_ms, "idle_timeout")?;
+    let timeout_ms = parse_optional_duration_ms(body.timeout, body.timeout_ms, "timeout")?;
+    let result = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id,
+            agent_id: body.agent_id,
+            command: body.command,
+            cwd: body.cwd,
+            hooks: body.hooks.unwrap_or_default(),
+            callback_url: body.callback_url,
+            state_ref: body.state_ref,
+            idle_timeout_ms,
+            timeout_ms,
+        },
+    )
+    .map_err(ApiError::from)?;
+    if let Err(err) = spawn_process_runner(&db, &result.run.id) {
+        let _ = mark_process_terminal(
+            &db,
+            &result.run.id,
+            "failed",
+            None,
+            None,
+            &format!("runner_spawn_error:{err}"),
+        );
+        return Err(ApiError::internal(err.to_string()));
+    }
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+pub async fn process_get_handler(
+    State(db): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let run = get_process_run(&db, &run_id).map_err(ApiError::from)?;
+    Ok(Json(run))
+}
+
+pub async fn process_kill_handler(
+    State(db): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let run = request_process_kill(&db, &run_id).map_err(ApiError::from)?;
+    Ok(Json(run))
+}
+
+pub async fn process_logs_handler(
+    State(db): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let logs = get_process_logs(&db, &run_id).map_err(ApiError::from)?;
+    Ok(Json(logs))
 }
 
 pub async fn go_handler(

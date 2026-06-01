@@ -5,6 +5,7 @@ pub mod events;
 pub mod files;
 pub mod meta;
 pub mod notes;
+pub mod processes;
 pub mod projects;
 pub mod schema;
 pub mod sweeper;
@@ -26,6 +27,13 @@ pub use events::{insert_event, list_events, EventFilters};
 pub use files::{add_task_files, check_file_conflicts, list_task_files, FileConflict};
 pub use meta::{delete_meta, get_meta, set_meta};
 pub use notes::{add_note, list_notes};
+pub use processes::{
+    dispatch_due_notifications, get_process_logs, get_process_run, launch_process_run,
+    list_process_hooks, list_process_runs, mark_process_heartbeat, mark_process_hook_matched,
+    mark_process_output, mark_process_started, mark_process_terminal, process_log_dir,
+    request_process_kill, spawn_process_runner, ProcessHookSpec, ProcessLaunchRequest,
+    ProcessLaunchResult, ProcessLogs, ProcessRun, ProcessRunFilters, TaskWait,
+};
 pub use projects::{
     create_project, fuzzy_find_project, get_project, list_projects, update_project_status,
 };
@@ -54,12 +62,21 @@ pub enum TaskgraphError {
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    path: Option<Arc<String>>,
 }
 
 impl Database {
     pub fn from_connection(conn: Connection) -> Self {
         Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: None,
+        }
+    }
+
+    pub fn from_connection_with_path(conn: Connection, path: String) -> Self {
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: Some(Arc::new(path)),
         }
     }
 
@@ -67,6 +84,10 @@ impl Database {
         self.conn
             .lock()
             .map_err(|_| anyhow!("database connection mutex poisoned"))
+    }
+
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref().map(String::as_str)
     }
 }
 

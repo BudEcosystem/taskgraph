@@ -1,7 +1,7 @@
 pub mod routes;
 pub mod sse;
 
-use crate::db::{init_db, next_sleep_due_at, run_sweep, Database};
+use crate::db::{dispatch_due_notifications, init_db, next_sleep_due_at, run_sweep, Database};
 use crate::mcp::handler::TaskgraphMcpHandler;
 use anyhow::Result;
 use axum::Router;
@@ -21,6 +21,7 @@ pub async fn run_server(db_path: &str, port: u16) -> Result<()> {
     tokio::spawn(async move {
         loop {
             let _ = run_sweep(&sweep_db);
+            let _ = dispatch_due_notifications(&sweep_db, 32);
             let sleep_for = match next_sleep_due_at(&sweep_db) {
                 Ok(Some(next_due)) => {
                     let now = chrono::Utc::now().naive_utc();

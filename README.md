@@ -19,6 +19,8 @@ taskgraph turns a plan into a directed graph of tasks:
   downstream tasks;
 - agents can put owned work into durable sleep, exit to save resources, and
   resume later with an opaque state reference;
+- agents can launch external processes under taskgraph observation and wake on
+  exit, kill, stuck timeout, or stdout/stderr hook signals;
 - notes, artifacts, events, progress, files, retries, timeouts, and approvals are
   tracked beside the task graph;
 - plans can be changed while work is in progress with insert, amend, split,
@@ -38,6 +40,8 @@ Use taskgraph when you have:
 - a plan that may change after new information appears;
 - agents that wait on external work, downloads, training runs, rate limits, or
   other time-based gaps and should not stay alive just to poll;
+- agents that launch local processes and need a durable callback when the process
+  finishes, is killed, gets stuck, or emits a known output signal;
 - a local-first workflow where a single binary and SQLite file are preferable to
   Redis, a queue, or a workflow server;
 - an MCP-compatible editor or agent that needs tools for planning and execution.
@@ -60,6 +64,9 @@ tables:
 - `artifacts`: named outputs attached to tasks.
 - `task_notes`: comments for inter-agent communication.
 - `task_files`: files touched by tasks for conflict checks.
+- `process_runs`, `process_hooks`, `task_waits`: durable process observation
+  state for launched child processes.
+- `notification_outbox`: retryable HTTP callbacks for process events.
 - `events`: audit and monitoring log.
 
 Task state flow:
@@ -244,6 +251,42 @@ After resume, the task returns to `running` and the stored `state_ref` is return
 to the caller. Downstream scheduling still depends on `done`; sleep only suspends
 the current owner. Wake times are stored with millisecond precision.
 
+## Process observation
+
+Use process observation when an agent owns a task and wants taskgraph to launch a
+child process, observe it after the agent exits, and wake the same logical agent
+when something meaningful happens.
+
+```sh
+taskgraph go --agent trainer-1
+
+taskgraph process launch t-k9x2pq \
+  --agent trainer-1 \
+  --hook model_ready=stdout:MODEL_READY \
+  --callback http://127.0.0.1:9000/taskgraph \
+  --state-ref '{"checkpoint":"hf-download-42"}' \
+  -- python download_model.py --model x
+```
+
+`process launch` creates a `process_run`, creates a process `task_wait`, moves the
+task to `sleeping`, and starts a detached taskgraph runner. The runner launches
+the child process, captures stdout/stderr logs, watches configured hooks, records
+exit/killed/stuck states, and dispatches callback notifications from SQLite.
+
+When a hook or terminal process state happens, taskgraph marks the wait due and
+exposes it through the same wake/resume flow:
+
+```sh
+taskgraph wakes due --project p-ab12cd
+taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id w-a1b2c3
+```
+
+Callbacks are delivered at least once with an `Idempotency-Key` header of
+`taskgraph:event:<event_id>`. Agents should make callback handlers idempotent.
+HTTP process launch is disabled by default; start the server with
+`taskgraph serve --enable-process-launch` if remote clients should be allowed to
+launch local processes.
+
 ## Interfaces
 
 taskgraph exposes the same SQLite-backed graph through three interfaces.
@@ -378,6 +421,10 @@ composite tasks.
 | `taskgraph wakes due [--project ...]` | List sleeping tasks whose wake time has arrived. |
 | `taskgraph resume <task_id> --agent <name>` | Resume a sleeping task for the same logical agent. |
 | `taskgraph task resume <task_id> --agent <name>` | Same as `resume`; accepts `--sleep-id`. |
+| `taskgraph process launch <task_id> --agent ... -- <cmd>` | Launch and observe a process, then wake on hook/exit/killed/stuck. |
+| `taskgraph process get <run_id>` | Inspect a process run. |
+| `taskgraph process logs <run_id>` | Read captured stdout/stderr. |
+| `taskgraph process kill <run_id>` | Request termination of a running process. |
 | `taskgraph done <task_id>` | Shortcut for `taskgraph task done`. |
 | `taskgraph task done <task_id>` | Complete a task, optionally with result JSON. |
 | `taskgraph task fail <task_id> --error ...` | Mark a running task as failed. |
@@ -406,6 +453,7 @@ Sleep durations accept bare milliseconds or `ms`, `s`, `m`, and `h` suffixes:
 taskgraph sleep t-k9x2pq 3000
 taskgraph sleep t-k9x2pq 3s --state-ref '{"external_job":"download-42"}'
 taskgraph resume t-k9x2pq --agent agent-1 --sleep-id s-a1b2c3
+taskgraph process launch t-k9x2pq --agent agent-1 --hook ready=stdout:READY -- sh -c 'echo READY'
 ```
 
 ### Plan adaptation commands
@@ -485,6 +533,7 @@ MCP tools mirror the CLI and return JSON strings. The main tools are:
 | Task creation | `taskgraph_task_create`, `taskgraph_task_create_batch`, `taskgraph_task_decompose`, `taskgraph_task_replan` |
 | Work loop | `taskgraph_go`, `taskgraph_task_next`, `taskgraph_task_claim`, `taskgraph_task_start`, `taskgraph_task_sleep`, `taskgraph_task_resume`, `taskgraph_task_done` |
 | Task state | `taskgraph_task_fail`, `taskgraph_task_pause`, `taskgraph_task_update`, `taskgraph_task_get_context`, `taskgraph_wakes_due` |
+| Processes | `taskgraph_process_launch`, `taskgraph_process_get`, `taskgraph_process_list`, `taskgraph_process_kill`, `taskgraph_process_logs` |
 | Dependencies | `taskgraph_dependency_add`, `taskgraph_dependency_remove` |
 | Adaptation | `taskgraph_what_if`, `taskgraph_task_insert`, `taskgraph_ahead`, `taskgraph_task_amend`, `taskgraph_task_pivot`, `taskgraph_task_split` |
 | Collaboration | `taskgraph_task_note`, `taskgraph_task_notes` |
@@ -496,9 +545,10 @@ Typical MCP flow:
 2. `taskgraph_task_create` for each planned task
 3. `taskgraph_go` to claim work
 4. `taskgraph_task_sleep` when the owning agent should save state and exit until a wake time
-5. `taskgraph_task_resume` when `taskgraph_wakes_due` or `task_wake_due` says the wait is due
-6. `taskgraph_task_done` with `result` and optionally `next: true`
-7. `taskgraph_status` or `taskgraph_project_overview` for progress
+5. `taskgraph_process_launch` when the wait is a child process that taskgraph should observe
+6. `taskgraph_task_resume` when `taskgraph_wakes_due` or `task_wake_due` says the wait is due
+7. `taskgraph_task_done` with `result` and optionally `next: true`
+8. `taskgraph_status` or `taskgraph_project_overview` for progress
 
 ## HTTP API reference
 
@@ -528,6 +578,10 @@ All REST routes are under `/api`.
 | `POST /api/tasks/{id}/progress` | Update progress. |
 | `POST /api/tasks/{id}/sleep` | Put owned work into durable sleep. |
 | `POST /api/tasks/{id}/resume` | Resume a sleeping task for the same logical agent. |
+| `POST /api/tasks/{id}/processes` | Launch and observe a process for an owned task. Requires `--enable-process-launch`. |
+| `GET /api/processes/{id}` | Get process run status. |
+| `POST /api/processes/{id}/kill` | Request process termination. |
+| `GET /api/processes/{id}/logs` | Read captured stdout/stderr logs. |
 | `POST /api/tasks/{id}/done` | Complete a task. |
 | `POST /api/tasks/{id}/pause` | Pause a task. |
 | `POST /api/tasks/{id}/fail` | Fail a task. |

@@ -47,6 +47,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP callbacks for process observations
+ureq = "2"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization
