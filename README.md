@@ -232,8 +232,9 @@ Without the server, a harness can still poll the durable state:
 taskgraph wakes due --project p-ab12cd
 ```
 
-Resume with the same logical agent. Pass `sleep_id` when you want to reject stale
-resume attempts from an older sleep cycle:
+Resume with the same logical agent after the wake time is due. Early resume
+attempts are rejected. Pass `sleep_id` when you want to reject stale resume
+attempts from an older sleep cycle:
 
 ```sh
 taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id s-a1b2c3
@@ -241,7 +242,7 @@ taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id s-a1b2c3
 
 After resume, the task returns to `running` and the stored `state_ref` is returned
 to the caller. Downstream scheduling still depends on `done`; sleep only suspends
-the current owner.
+the current owner. Wake times are stored with millisecond precision.
 
 ## Interfaces
 

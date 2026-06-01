@@ -1,6 +1,7 @@
 use crate::db::dependencies::{add_dependency, remove_dependency};
 use crate::db::{
-    dt_to_sql, json_to_sql, now_utc_naive, parse_dt, parse_json, Database, TaskgraphError,
+    dt_to_sql, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql,
+    truncate_to_millis, Database, TaskgraphError,
 };
 use crate::models::{generate_id, EventType, RetryBackoff, Task, TaskKind, TaskStatus};
 use anyhow::{anyhow, Result};
@@ -854,8 +855,10 @@ pub fn sleep_task(
     }
 
     let sleep_id = generate_id("sleep");
-    let now = now_utc_naive();
-    let wake_at = now + Duration::milliseconds(duration_ms);
+    let now = truncate_to_millis(now_utc_naive());
+    let wake_at = now
+        .checked_add_signed(Duration::milliseconds(duration_ms))
+        .ok_or_else(|| anyhow!("duration is too large"))?;
     let state_ref_sql = json_to_sql(&state_ref)?;
     let conn = db.lock()?;
     let changed = conn.execute(
@@ -863,10 +866,10 @@ pub fn sleep_task(
         params![
             task_id,
             &sleep_id,
-            dt_to_sql(wake_at),
+            sleep_dt_to_sql(wake_at),
             state_ref_sql,
             reason,
-            dt_to_sql(now)
+            sleep_dt_to_sql(now)
         ],
     )?;
     if changed == 0 {
@@ -911,6 +914,7 @@ pub fn resume_task(
     let state_ref = current.sleep_state_ref.clone();
     let previous_sleep_id = current.sleep_id.clone();
     let reason = current.sleep_reason.clone();
+    let sleep_until = current.sleep_until;
     if !matches!(current.status, TaskStatus::Sleeping) {
         return Err(TaskgraphError::InvalidTransition(format!(
             "task {task_id} must be sleeping to resume"
@@ -931,12 +935,21 @@ pub fn resume_task(
             );
         }
     }
+    let now = truncate_to_millis(now_utc_naive());
+    if let Some(wake_at) = sleep_until {
+        if now < wake_at {
+            return Err(TaskgraphError::InvalidTransition(format!(
+                "task {task_id} is not due until {}",
+                sleep_dt_to_sql(wake_at)
+            ))
+            .into());
+        }
+    }
 
     let conn = db.lock()?;
-    let now = now_utc_naive();
     let changed = conn.execute(
         RESUME_TASK,
-        params![task_id, agent_id, sleep_id, dt_to_sql(now)],
+        params![task_id, agent_id, sleep_id, sleep_dt_to_sql(now)],
     )?;
     if changed == 0 {
         return Err(TaskgraphError::InvalidTransition(format!(
@@ -968,7 +981,7 @@ pub fn resume_task(
 
 pub fn list_due_wakes(db: &Database, project_id: Option<&str>) -> Result<Vec<DueWake>> {
     let conn = db.lock()?;
-    let now = dt_to_sql(now_utc_naive());
+    let now = sleep_dt_to_sql(now_utc_naive());
     let mut stmt = conn.prepare(
         r#"
         SELECT id, project_id, agent_id, sleep_id, sleep_until, sleep_state_ref, sleep_reason, wake_emitted_at
@@ -1018,8 +1031,8 @@ pub fn next_sleep_due_at(db: &Database) -> Result<Option<chrono::NaiveDateTime>>
 }
 
 pub fn emit_due_wakes(db: &Database) -> Result<Vec<DueWake>> {
-    let now = now_utc_naive();
-    let now_s = dt_to_sql(now);
+    let now = truncate_to_millis(now_utc_naive());
+    let now_s = sleep_dt_to_sql(now);
     let mut conn = db.lock()?;
     let tx = conn.transaction()?;
     let mut stmt = tx.prepare(

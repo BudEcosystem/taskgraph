@@ -128,8 +128,8 @@ stateDiagram-v2
 to the ready queue. The task keeps its `agent_id`, stores a `sleep_id`, wake time,
 and opaque `state_ref`, then clears heartbeat pressure so the owning agent can
 exit. It is not claimable by another agent and is not reclaimed as stale. When
-the wake time is reached, taskgraph emits `task_wake_due`; the same logical agent
-or its harness calls `resume`.
+the millisecond-precision wake time is reached, taskgraph emits `task_wake_due`;
+the same logical agent or its harness calls `resume`.
 
 **Lenient transitions**: After real-world testing showed agents wasting 83% of session time fighting the state machine, we added lenient transitions. `done` now accepts tasks in `ready`, `claimed`, or `running` status, auto-filling timestamps. This means a single-agent workflow is `go` → `done` (2 commands), while multi-agent safety is preserved because the claim mechanism still prevents double-assignment.
 
@@ -312,7 +312,8 @@ The key design constraints are:
   one `task_wake_due` event even if the sweeper runs repeatedly.
 - **Owner preservation**: sleeping tasks are excluded from ready-queue claiming
   and heartbeat reclamation. Resume requires the same logical `agent_id`; an
-  optional `sleep_id` prevents stale resume attempts.
+  optional `sleep_id` prevents stale resume attempts. Resume before the wake time
+  is rejected.
 - **SQLite remains the source of truth**: the server's background loop only
   optimizes timing. If no server is running, `wakes_due` can still discover due
   tasks from the database.

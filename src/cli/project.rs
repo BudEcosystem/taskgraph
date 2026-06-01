@@ -582,6 +582,6 @@ fn render_node(
         } else {
             format!("{prefix}│  ")
         };
-        render_node(&to_task, by_id, outgoing, &next_prefix, child_last, printed);
+        render_node(to_task, by_id, outgoing, &next_prefix, child_last, printed);
     }
 }

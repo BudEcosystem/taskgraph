@@ -110,9 +110,10 @@ fn retry_delay_ms(base_delay: i64, backoff: RetryBackoff, retry_count: i32) -> i
 pub fn run_sweep(db: &Database) -> Result<SweepResult> {
     let now = chrono::Utc::now().naive_utc();
     let now_s = dt_to_sql(now);
-    let mut result = SweepResult::default();
-
-    result.wakes_emitted = emit_due_wakes(db)?.len();
+    let mut result = SweepResult {
+        wakes_emitted: emit_due_wakes(db)?.len(),
+        ..Default::default()
+    };
 
     {
         let conn = db.lock()?;

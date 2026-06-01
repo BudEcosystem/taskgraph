@@ -11,7 +11,7 @@ pub mod sweeper;
 pub mod tasks;
 
 use anyhow::{anyhow, Result};
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDateTime, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -71,6 +71,7 @@ impl Database {
 }
 
 const DATETIME_FMT: &str = "%Y-%m-%d %H:%M:%S";
+const SLEEP_DATETIME_FMT: &str = "%Y-%m-%d %H:%M:%S%.3f";
 
 pub(crate) fn now_utc_naive() -> NaiveDateTime {
     Utc::now().naive_utc()
@@ -80,8 +81,21 @@ pub(crate) fn dt_to_sql(dt: NaiveDateTime) -> String {
     dt.format(DATETIME_FMT).to_string()
 }
 
+pub(crate) fn truncate_to_millis(dt: NaiveDateTime) -> NaiveDateTime {
+    let extra_nanos = i64::from(dt.and_utc().timestamp_subsec_nanos() % 1_000_000);
+    dt - Duration::nanoseconds(extra_nanos)
+}
+
+pub(crate) fn sleep_dt_to_sql(dt: NaiveDateTime) -> String {
+    truncate_to_millis(dt)
+        .format(SLEEP_DATETIME_FMT)
+        .to_string()
+}
+
 pub(crate) fn parse_dt(value: String) -> Result<NaiveDateTime> {
-    Ok(NaiveDateTime::parse_from_str(&value, DATETIME_FMT)?)
+    NaiveDateTime::parse_from_str(&value, SLEEP_DATETIME_FMT)
+        .or_else(|_| NaiveDateTime::parse_from_str(&value, DATETIME_FMT))
+        .map_err(Into::into)
 }
 
 pub(crate) fn json_to_sql(value: &Option<Value>) -> Result<Option<String>> {

@@ -542,7 +542,44 @@ assert_eq "replan created two subtasks" "2" "$(jq_field "$REPLAN_OUT" "subtasks_
 echo ""
 
 # ─────────────────────────────────────────────
-echo "18. VERSION & HELP"
+echo "18. DURABLE SLEEP / WAKE"
+echo "─────────────────────────────────────────"
+
+SLEEP_TASK=$($TASKGRAPH --db "$DB" --json task create --project "$PROJ_ID" --title "Sleep Task")
+SLEEP_TASK_ID=$(jq_field "$SLEEP_TASK" "id")
+$TASKGRAPH --db "$DB" --json task claim "$SLEEP_TASK_ID" --agent sleeper >/dev/null
+$TASKGRAPH --db "$DB" --json task start "$SLEEP_TASK_ID" >/dev/null
+
+SLEEP_OUT=$($TASKGRAPH --db "$DB" --json -c sleep "$SLEEP_TASK_ID" 1200 --state-ref '{"token":"download-42"}' --reason "waiting")
+SLEEP_ID=$(jq_field "$SLEEP_OUT" "sleep_id")
+assert_eq "sleep marks task sleeping" "sleeping" "$(jq_field "$SLEEP_OUT" "status")"
+assert_regex "sleep id uses short format" '^s-[a-z0-9]{6}$' "$SLEEP_ID"
+
+SLEEP_GET=$($TASKGRAPH --db "$DB" --json task get "$SLEEP_TASK_ID")
+assert_eq "sleep keeps agent ownership" "sleeper" "$(jq_field "$SLEEP_GET" "agent_id")"
+assert_eq "sleep persisted state ref" "download-42" "$(echo "$SLEEP_GET" | python3 -c "import sys,json; print(json.load(sys.stdin)['sleep_state_ref']['token'])")"
+
+EARLY_RESUME=$($TASKGRAPH --db "$DB" --json -c resume "$SLEEP_TASK_ID" --agent sleeper --sleep-id "$SLEEP_ID" 2>&1 || true)
+assert_contains "early resume rejected" "not due until" "$EARLY_RESUME"
+
+NOT_DUE=$($TASKGRAPH --db "$DB" --json wakes due --project "$PROJ_ID")
+assert_eq "sleep not due immediately" "0" "$(jq_len "$NOT_DUE")"
+
+sleep 1.3
+DUE_SLEEP=$($TASKGRAPH --db "$DB" --json wakes due --project "$PROJ_ID")
+assert_eq "sleep becomes due" "1" "$(jq_len "$DUE_SLEEP")"
+assert_eq "due wake has state ref" "download-42" "$(echo "$DUE_SLEEP" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['state_ref']['token'])")"
+
+RESUME_OUT=$($TASKGRAPH --db "$DB" --json -c resume "$SLEEP_TASK_ID" --agent sleeper --sleep-id "$SLEEP_ID")
+assert_eq "resume returns running" "running" "$(jq_field "$RESUME_OUT" "status")"
+assert_eq "resume returns state ref" "download-42" "$(echo "$RESUME_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['state_ref']['token'])")"
+
+$TASKGRAPH --db "$DB" --json task done "$SLEEP_TASK_ID" --result '{"summary":"resumed"}' >/dev/null
+
+echo ""
+
+# ─────────────────────────────────────────────
+echo "19. VERSION & HELP"
 echo "─────────────────────────────────────────"
 
 VERSION=$($TASKGRAPH --version)
@@ -557,7 +594,7 @@ assert_contains "help shows serve" "serve" "$HELP"
 echo ""
 
 # ─────────────────────────────────────────────
-echo "19. JIT ADAPTIVE PLANNING PRIMITIVES"
+echo "20. JIT ADAPTIVE PLANNING PRIMITIVES"
 echo "─────────────────────────────────────────"
 
 JIT_PROJECT=$($TASKGRAPH --db "$DB" --json project create "jit-project")

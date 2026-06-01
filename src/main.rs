@@ -203,7 +203,8 @@ taskgraph sleep t-TASKID 3000 --state-ref '{{"checkpoint":"hf-download-42"}}' --
 # A server emits task_wake_due near the wake time. Without a server, poll:
 taskgraph wakes due
 
-# Restart the same logical agent and resume. Pass --sleep-id to reject stale resumes.
+# Restart the same logical agent and resume after the wake time is due.
+# Pass --sleep-id to reject stale resumes.
 taskgraph resume t-TASKID --agent my-agent --sleep-id s-a1b2c3
 ```
 
@@ -262,7 +263,7 @@ taskgraph task notes t-abc123
 - **Default project**: `taskgraph use <id>` sets default, no --project needed per command
 - **Output modes**: human default, `--json` for structured, `-c`/`--compact` for token-efficient
 - **Handoff protocol**: when you complete a task with --result, that data is available to the agent working on downstream tasks via `taskgraph go`
-- **Sleep protocol**: when waiting, `taskgraph sleep` stores an opaque state reference and keeps the current `agent_id`; `taskgraph resume` returns that state to the same logical agent
+- **Sleep protocol**: when waiting, `taskgraph sleep` stores an opaque state reference and keeps the current `agent_id`; after the wake time, `taskgraph resume` returns that state to the same logical agent
 - **Effect analysis**: insert/pivot/split responses include which tasks got delayed/accelerated/unblocked
 
 ### Multi-Agent Pattern
@@ -340,6 +341,7 @@ EVENTS (real-time):
 - POST /go is the preferred agent entry point — returns task + upstream context
 - POST /tasks/:id/sleep stores an opaque state_ref and keeps the current agent_id
 - task_wake_due events and /wakes/due tell a harness when to restart/resume the same logical agent
+- POST /tasks/:id/resume is rejected until the sleeping task's wake time is due
 - POST /tasks/:id/done with result data enables handoff to downstream tasks"#
     );
 }

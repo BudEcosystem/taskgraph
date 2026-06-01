@@ -653,7 +653,9 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "task_id": { "type": "string" },
                     "duration": { "type": "string", "description": "3000 (ms), 3s, 5m, 1h" },
-                    "state_ref": { "type": "object" },
+                    "state_ref": {
+                        "description": "Opaque JSON state reference returned on resume"
+                    },
                     "reason": { "type": "string" }
                 },
                 "required": ["task_id", "duration"]

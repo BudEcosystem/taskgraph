@@ -192,6 +192,7 @@ fn parse_sleep_duration_accepts_ms_and_suffixes() {
     assert_eq!(parse_sleep_duration_ms("1h").unwrap(), 3_600_000);
     assert!(parse_sleep_duration_ms("0s").is_err());
     assert!(parse_sleep_duration_ms("abc").is_err());
+    assert!(parse_sleep_duration_ms("9223372036854775807h").is_err());
 }
 
 #[test]
@@ -227,6 +228,21 @@ fn sleep_resume_round_trip_returns_state_ref() {
     let stale = resume_task(&db, &task.id, "agent-a", Some("s-stale")).unwrap_err();
     assert!(stale.to_string().contains("sleep_id mismatch"));
 
+    let early = resume_task(&db, &task.id, "agent-a", Some(&sleep.sleep_id)).unwrap_err();
+    assert!(early.to_string().contains("not due until"));
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET sleep_until = ?2 WHERE id = ?1",
+            rusqlite::params![
+                &task.id,
+                crate::db::sleep_dt_to_sql(now() - Duration::seconds(1))
+            ],
+        )
+        .unwrap();
+    }
+
     let resumed = resume_task(&db, &task.id, "agent-a", Some(&sleep.sleep_id)).unwrap();
     assert_eq!(resumed.task.status, TaskStatus::Running);
     assert_eq!(resumed.task.agent_id.as_deref(), Some("agent-a"));
@@ -240,6 +256,101 @@ fn sleep_resume_round_trip_returns_state_ref() {
     assert!(fetched.sleep_id.is_none());
     assert!(fetched.sleep_until.is_none());
     assert!(fetched.sleep_state_ref.is_none());
+}
+
+#[test]
+fn sleep_uses_millisecond_precision_for_due_checks() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "SleepPrecision", None, None, None).unwrap();
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "precise", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let sleep = sleep_task(&db, &task.id, 3_000, None, None).unwrap();
+    let fetched = get_task(&db, &task.id).unwrap();
+    assert_eq!(fetched.sleep_until, Some(sleep.wake_at));
+
+    let stored: String = db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT sleep_until FROM tasks WHERE id = ?1",
+            rusqlite::params![&task.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.contains('.'),
+        "sleep_until should include milliseconds: {stored}"
+    );
+    assert_eq!(stored.len(), "YYYY-MM-DD HH:MM:SS.mmm".len());
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET sleep_until = ?2 WHERE id = ?1",
+            rusqlite::params![
+                &task.id,
+                crate::db::sleep_dt_to_sql(now() + Duration::milliseconds(250)),
+            ],
+        )
+        .unwrap();
+    }
+    assert!(list_due_wakes(&db, Some(&project.id)).unwrap().is_empty());
+}
+
+#[test]
+fn sleep_rejects_duration_that_cannot_fit_in_datetime() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "SleepOverflow", None, None, None).unwrap();
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "overflow", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let err = sleep_task(&db, &task.id, i64::MAX, None, None).unwrap_err();
+    assert!(err.to_string().contains("duration is too large"));
+}
+
+#[test]
+fn due_wake_parses_legacy_second_precision_sleep_rows() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "LegacySleep", None, None, None).unwrap();
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "legacy", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+    sleep_task(&db, &task.id, 60_000, Some(json!({"legacy": true})), None).unwrap();
+
+    {
+        let conn = db.lock().unwrap();
+        conn.execute(
+            "UPDATE tasks SET sleep_until = ?2 WHERE id = ?1",
+            rusqlite::params![&task.id, crate::db::dt_to_sql(now() - Duration::seconds(1))],
+        )
+        .unwrap();
+    }
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].task_id, task.id);
+    assert_eq!(due[0].state_ref, Some(json!({"legacy": true})));
 }
 
 #[test]
@@ -259,7 +370,7 @@ fn due_wake_emission_is_idempotent_and_sleeping_is_not_reclaimed() {
             "UPDATE tasks SET sleep_until = ?2, last_heartbeat = ?3 WHERE id = ?1",
             rusqlite::params![
                 &task.id,
-                crate::db::dt_to_sql(now() - Duration::seconds(1)),
+                crate::db::sleep_dt_to_sql(now() - Duration::seconds(1)),
                 crate::db::dt_to_sql(now() - Duration::seconds(600)),
             ],
         )
