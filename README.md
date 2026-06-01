@@ -236,7 +236,7 @@ Resume with the same logical agent. Pass `sleep_id` when you want to reject stal
 resume attempts from an older sleep cycle:
 
 ```sh
-taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id sleep-a1b2c3d4
+taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id s-a1b2c3
 ```
 
 After resume, the task returns to `running` and the stored `state_ref` is returned
@@ -334,7 +334,7 @@ curl -s 'http://localhost:8484/api/wakes/due?project=p-ab12cd'
 
 curl -s -X POST http://localhost:8484/api/tasks/t-k9x2pq/resume \
   -H 'content-type: application/json' \
-  -d '{"agent_id":"agent-1","sleep_id":"sleep-a1b2c3d4"}'
+  -d '{"agent_id":"agent-1","sleep_id":"s-a1b2c3"}'
 ```
 
 The HTTP server runs a background sweeper that periodically promotes ready tasks,
@@ -404,7 +404,7 @@ Sleep durations accept bare milliseconds or `ms`, `s`, `m`, and `h` suffixes:
 ```sh
 taskgraph sleep t-k9x2pq 3000
 taskgraph sleep t-k9x2pq 3s --state-ref '{"external_job":"download-42"}'
-taskgraph resume t-k9x2pq --agent agent-1 --sleep-id sleep-a1b2c3d4
+taskgraph resume t-k9x2pq --agent agent-1 --sleep-id s-a1b2c3
 ```
 
 ### Plan adaptation commands

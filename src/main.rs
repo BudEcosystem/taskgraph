@@ -204,7 +204,7 @@ taskgraph sleep t-TASKID 3000 --state-ref '{{"checkpoint":"hf-download-42"}}' --
 taskgraph wakes due
 
 # Restart the same logical agent and resume. Pass --sleep-id to reject stale resumes.
-taskgraph resume t-TASKID --agent my-agent --sleep-id sleep-a1b2c3d4
+taskgraph resume t-TASKID --agent my-agent --sleep-id s-a1b2c3
 ```
 
 ### Checking Status

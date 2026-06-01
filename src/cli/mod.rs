@@ -54,7 +54,7 @@ pub use task::{
         \x20 taskgraph task create --title \"Implement\" --dep t-a1b2c3       Add dependent task\n\
         \x20 taskgraph go --agent claude-1                                   Claim + start next ready\n\
         \x20 taskgraph sleep t-d4e5f6 3000 --state-ref '{\"checkpoint\":\"download-42\"}'\n\
-        \x20 taskgraph resume t-d4e5f6 --agent claude-1 --sleep-id sleep-a1b2c3\n\
+        \x20 taskgraph resume t-d4e5f6 --agent claude-1 --sleep-id s-a1b2c3\n\
         \x20 taskgraph done t-d4e5f6 --result '{\"api\":\"done\"}' --next --agent claude-1\n\
         \x20 taskgraph task insert --after t-a1 --before t-b2 --title \"Add validation\"\n\
         \x20 taskgraph what-if cancel t-a1b2c3                               Preview cancel effects\n\
