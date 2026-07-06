@@ -204,6 +204,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   target_url      TEXT NOT NULL,
   payload         JSON NOT NULL,
   status          TEXT NOT NULL DEFAULT 'pending',
+  lease_id        TEXT,
   attempts        INTEGER NOT NULL DEFAULT 0,
   next_attempt_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   last_error      TEXT,
@@ -301,6 +302,7 @@ pub fn init_db(path: &str) -> Result<Database> {
     let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_state_ref JSON;");
     let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN sleep_reason TEXT;");
     let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN wake_emitted_at DATETIME;");
+    let _ = conn.execute_batch("ALTER TABLE notification_outbox ADD COLUMN lease_id TEXT;");
     conn.execute_batch(INDEX_TASKS_SLEEP_UNTIL)?;
     conn.execute_batch(INDEX_PROCESS_RUNS_TASK)?;
     conn.execute_batch(INDEX_PROCESS_RUNS_WAIT)?;

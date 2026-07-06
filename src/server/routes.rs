@@ -564,15 +564,6 @@ fn emit_event(
     Ok(())
 }
 
-fn process_launch_enabled() -> bool {
-    matches!(
-        std::env::var("TASKGRAPH_ENABLE_PROCESS_LAUNCH")
-            .unwrap_or_default()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
 fn parse_optional_duration_ms(
     text: Option<String>,
     explicit_ms: Option<i64>,
@@ -1150,15 +1141,7 @@ pub async fn process_launch_handler(
         },
     )
     .map_err(ApiError::from)?;
-    if let Err(err) = spawn_process_runner(&db, &result.run.id) {
-        let _ = mark_process_terminal(
-            &db,
-            &result.run.id,
-            "failed",
-            None,
-            None,
-            &format!("runner_spawn_error:{err}"),
-        );
+    if let Err(err) = spawn_process_runner_or_mark_failed(&db, &result.run.id) {
         return Err(ApiError::internal(err.to_string()));
     }
     Ok((StatusCode::CREATED, Json(result)))

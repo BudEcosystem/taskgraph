@@ -756,12 +756,35 @@ pub fn fail_task(db: &Database, task_id: &str, error: &str) -> Result<Task> {
 pub fn cancel_task(db: &Database, task_id: &str, cascade: bool) -> Result<usize> {
     let conn = db.lock()?;
     let now = dt_to_sql(now_utc_naive());
+    let mut task_ids = vec![task_id.to_string()];
+    if cascade {
+        let mut stmt = conn.prepare(
+            r#"
+            WITH RECURSIVE downstream(task_id) AS (
+              SELECT to_task FROM dependencies WHERE from_task = ?1
+              UNION ALL
+              SELECT d.to_task FROM dependencies d
+              JOIN downstream ds ON d.from_task = ds.task_id
+            )
+            SELECT task_id FROM downstream;
+            "#,
+        )?;
+        let mut rows = stmt.query(params![task_id])?;
+        while let Some(row) = rows.next()? {
+            task_ids.push(row.get(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+    }
     let changed = conn.execute(CANCEL_TASK, params![task_id, now])?;
     let mut total = changed;
     if cascade {
         total += conn.execute(CANCEL_DOWNSTREAM, params![task_id, now])?;
     }
     drop(conn);
+    for id in task_ids {
+        let _ = crate::db::processes::request_process_kill_for_task(db, &id);
+    }
     let _ = crate::db::insert_event(
         db,
         Some(task_id),

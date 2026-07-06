@@ -62,7 +62,11 @@ pub use task::{
         \x20 taskgraph status --detail                                       Per-task breakdown\n\
         \x20 taskgraph --json -c status                                      Compact JSON for LLMs\n\n\
         ENVIRONMENT:\n\
-        \x20 TASKGRAPH_DB     Path to SQLite database (default: .taskgraph.db)"
+        \x20 TASKGRAPH_DB                         Path to SQLite database (default: .taskgraph.db)\n\
+        \x20 TASKGRAPH_ENABLE_PROCESS_LAUNCH     Enable MCP process launch for trusted local clients\n\
+        \x20 TASKGRAPH_PROCESS_RUNNER_STALE_MS   Observer heartbeat grace window (default: 15000)\n\
+        \x20 TASKGRAPH_PROCESS_LOG_MAX_BYTES     Captured bytes per process stream (default: 10485760)\n\
+        \x20 TASKGRAPH_PROCESS_LOG_READ_MAX_BYTES Bytes returned by process logs per stream (default: 262144)"
 )]
 pub struct Cli {
     #[arg(long, default_value_t = default_db_path(), global = true, help = "Path to SQLite database file")]

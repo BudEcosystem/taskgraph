@@ -11,10 +11,10 @@ use crate::db::{
     get_process_logs, get_process_run, get_project, get_task, get_upstream_artifacts,
     insert_task_between, launch_process_run, list_artifacts, list_dependencies, list_due_wakes,
     list_notes, list_process_runs, list_tasks, parse_sleep_duration_ms, pause_task, pivot_subtree,
-    project_state, promote_ready_tasks, remove_dependency, request_process_kill, resume_task,
-    run_sweep, sleep_task, snapshot_task_statuses, spawn_process_runner, split_task, start_task,
-    update_task, Database, NewSubtask, ProcessHookSpec, ProcessLaunchRequest, ProcessRunFilters,
-    SplitPart, TaskListFilters,
+    process_launch_enabled, project_state, promote_ready_tasks, remove_dependency,
+    request_process_kill, resume_task, run_sweep, sleep_task, snapshot_task_statuses,
+    spawn_process_runner_or_mark_failed, split_task, start_task, update_task, Database, NewSubtask,
+    ProcessHookSpec, ProcessLaunchRequest, ProcessRunFilters, SplitPart, TaskListFilters,
 };
 use crate::models::{
     generate_id, Artifact, DependencyCondition, DependencyKind, RetryBackoff, Task, TaskKind,
@@ -715,7 +715,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         json!({
             "name": "taskgraph_process_launch",
-            "description": "Launch and observe a process for an owned task; wakes/calls back on hook, exit, kill, or stuck",
+            "description": "Launch and observe a process for an owned task; wakes/calls back on hook, exit, kill, or stuck. Requires TASKGRAPH_ENABLE_PROCESS_LAUNCH=1.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1856,6 +1856,11 @@ fn taskgraph_wakes_due(db: &Database, args: Value) -> ToolHandlerResult {
 }
 
 fn taskgraph_process_launch(db: &Database, args: Value) -> ToolHandlerResult {
+    if !process_launch_enabled() {
+        return Err(anyhow!(
+            "process launch is disabled; set TASKGRAPH_ENABLE_PROCESS_LAUNCH=1 or start HTTP with --enable-process-launch"
+        ));
+    }
     let args: ProcessLaunchArgs = serde_json::from_value(args)?;
     let idle_timeout_ms =
         parse_process_duration(args.idle_timeout, args.idle_timeout_ms, "idle_timeout")?;
@@ -1874,17 +1879,7 @@ fn taskgraph_process_launch(db: &Database, args: Value) -> ToolHandlerResult {
             timeout_ms,
         },
     )?;
-    if let Err(err) = spawn_process_runner(db, &result.run.id) {
-        let _ = crate::db::mark_process_terminal(
-            db,
-            &result.run.id,
-            "failed",
-            None,
-            None,
-            &format!("runner_spawn_error:{err}"),
-        );
-        return Err(err);
-    }
+    spawn_process_runner_or_mark_failed(db, &result.run.id)?;
     Ok(serde_json::to_value(result)?)
 }
 

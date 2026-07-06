@@ -457,6 +457,424 @@ fn process_hook_marks_wait_due_once() {
 }
 
 #[test]
+fn process_due_wake_reports_actual_process_reason() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessReason", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "download model", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo READY".to_string()],
+            cwd: None,
+            hooks: vec![ProcessHookSpec {
+                name: "model_ready".to_string(),
+                stream: "stdout".to_string(),
+                pattern: "READY".to_string(),
+            }],
+            callback_url: None,
+            state_ref: Some(json!({"checkpoint": "reason"})),
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        123,
+        456,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+    mark_process_hook_matched(
+        &db,
+        &launched.run.id,
+        "model_ready",
+        "READY",
+        "stdout",
+        "READY",
+    )
+    .unwrap();
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].reason.as_deref(), Some("process_hook"));
+
+    let resumed = resume_task(&db, &task.id, "agent-a", Some(&launched.wait.id)).unwrap();
+    assert_eq!(resumed.reason.as_deref(), Some("process_hook"));
+}
+
+#[test]
+fn process_kill_can_be_queued_before_child_pid_exists() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessQueuedKill", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "queued kill", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: None,
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+
+    let queued = request_process_kill(&db, &launched.run.id).unwrap();
+    assert_eq!(queued.status, "kill_requested");
+    assert!(queued.pid.is_none());
+
+    let started = mark_process_started(
+        &db,
+        &launched.run.id,
+        999_999_991,
+        999_999_992,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+    assert_eq!(started.status, "kill_requested");
+    assert_eq!(started.pid, Some(999_999_991));
+}
+
+#[test]
+fn stale_created_process_run_is_reaped_and_wakes_task() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessCreatedReap", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "created stale", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: Some(json!({"case": "created"})),
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+
+    let old = crate::db::sleep_dt_to_sql(now() - Duration::seconds(60));
+    db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE process_runs SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![&launched.run.id, old],
+        )
+        .unwrap();
+
+    let reaped = reap_stale_process_runs(&db, Duration::milliseconds(1)).unwrap();
+    assert_eq!(reaped, 1);
+    let run = get_process_run(&db, &launched.run.id).unwrap();
+    assert_eq!(run.status, "stuck");
+    assert_eq!(run.terminal_reason.as_deref(), Some("runner_missing"));
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].sleep_id, launched.wait.id);
+    assert_eq!(due[0].reason.as_deref(), Some("runner_missing"));
+}
+
+#[test]
+fn stale_running_process_run_is_reaped_and_wakes_task() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessRunningReap", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "running stale", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: Some(json!({"case": "running"})),
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        999_999_981,
+        999_999_982,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+
+    let old = crate::db::sleep_dt_to_sql(now() - Duration::seconds(60));
+    db.lock()
+        .unwrap()
+        .execute(
+            "UPDATE process_runs SET last_heartbeat_at = ?2, updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![&launched.run.id, old],
+        )
+        .unwrap();
+
+    let reaped = reap_stale_process_runs(&db, Duration::milliseconds(1)).unwrap();
+    assert_eq!(reaped, 1);
+    let run = get_process_run(&db, &launched.run.id).unwrap();
+    assert_eq!(run.status, "stuck");
+    assert_eq!(run.terminal_reason.as_deref(), Some("observer_lost"));
+
+    let due = list_due_wakes(&db, Some(&project.id)).unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].sleep_id, launched.wait.id);
+    assert_eq!(due[0].reason.as_deref(), Some("observer_lost"));
+}
+
+#[test]
+fn cancelling_task_requests_owned_process_kill() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessCancelKill", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "cancel kills", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "sleep 10".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: None,
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        999_999_971,
+        999_999_972,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+
+    let cancelled = cancel_task(&db, &task.id, false).unwrap();
+    assert_eq!(cancelled, 1);
+    let run = get_process_run(&db, &launched.run.id).unwrap();
+    assert_eq!(run.status, "kill_requested");
+}
+
+#[test]
+fn process_logs_are_returned_as_bounded_tail() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ProcessLogBound", None, None, None).unwrap();
+
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "log bound", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo logs".to_string()],
+            cwd: None,
+            hooks: vec![],
+            callback_url: None,
+            state_ref: None,
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    let stdout_path = std::env::temp_dir().join(format!("taskgraph-log-{}.out", launched.run.id));
+    let stderr_path = std::env::temp_dir().join(format!("taskgraph-log-{}.err", launched.run.id));
+    let mut big = vec![b'a'; 300_000];
+    big.extend_from_slice(b"tail-marker");
+    std::fs::write(&stdout_path, big).unwrap();
+    std::fs::write(&stderr_path, b"small stderr").unwrap();
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        999_999_961,
+        999_999_962,
+        &stdout_path.to_string_lossy(),
+        &stderr_path.to_string_lossy(),
+    )
+    .unwrap();
+
+    let logs = get_process_logs(&db, &launched.run.id).unwrap();
+    assert!(logs.stdout_truncated);
+    assert!(!logs.stderr_truncated);
+    assert!(logs.stdout.unwrap().contains("tail-marker"));
+    assert_eq!(logs.max_bytes, 256 * 1024);
+}
+
+#[test]
+fn concurrent_notification_dispatchers_lease_outbox_rows_once() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration as StdDuration, Instant};
+
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let callback_url = format!("http://{}", listener.local_addr().unwrap());
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let server_count = request_count.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + StdDuration::from_secs(2);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    server_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(StdDuration::from_millis(100)));
+                    let mut buf = [0_u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    thread::sleep(StdDuration::from_millis(250));
+                    let _ =
+                        stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let project = create_project(&db, "OutboxLease", None, None, None).unwrap();
+    let task = create_task(
+        &db,
+        &make_task(&project.id, "callback", TaskStatus::Ready),
+        &[],
+    )
+    .unwrap();
+    claim_task(&db, &task.id, "agent-a").unwrap().unwrap();
+    start_task(&db, &task.id).unwrap();
+    let launched = launch_process_run(
+        &db,
+        ProcessLaunchRequest {
+            task_id: task.id.clone(),
+            agent_id: "agent-a".to_string(),
+            command: vec!["sh".to_string(), "-c".to_string(), "echo READY".to_string()],
+            cwd: None,
+            hooks: vec![ProcessHookSpec {
+                name: "ready".to_string(),
+                stream: "stdout".to_string(),
+                pattern: "READY".to_string(),
+            }],
+            callback_url: Some(callback_url),
+            state_ref: None,
+            idle_timeout_ms: None,
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    mark_process_started(
+        &db,
+        &launched.run.id,
+        999_999_951,
+        999_999_952,
+        "/tmp/stdout",
+        "/tmp/stderr",
+    )
+    .unwrap();
+    mark_process_hook_matched(&db, &launched.run.id, "ready", "READY", "stdout", "READY").unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let db_path_a = db_path.clone();
+    let db_path_b = db_path.clone();
+    let barrier_a = barrier.clone();
+    let barrier_b = barrier.clone();
+    let dispatch_a = thread::spawn(move || {
+        let db = init_db(&db_path_a).unwrap();
+        barrier_a.wait();
+        dispatch_due_notifications(&db, 16).unwrap()
+    });
+    let dispatch_b = thread::spawn(move || {
+        let db = init_db(&db_path_b).unwrap();
+        barrier_b.wait();
+        dispatch_due_notifications(&db, 16).unwrap()
+    });
+    barrier.wait();
+    let delivered = dispatch_a.join().unwrap() + dispatch_b.join().unwrap();
+    server.join().unwrap();
+
+    assert_eq!(delivered, 1);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn sleep_uses_millisecond_precision_for_due_checks() {
     let db_path = test_db_path();
     let db = init_db(&db_path).unwrap();

@@ -8,11 +8,16 @@ use chrono::Duration;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const PROCESS_WAIT_SENTINEL: &str = "9999-12-31 23:59:59.999";
+const DEFAULT_PROCESS_RUNNER_STALE_MS: i64 = 15_000;
+const DEFAULT_PROCESS_LOG_READ_MAX_BYTES: u64 = 256 * 1024;
+pub const DEFAULT_PROCESS_LOG_CAPTURE_MAX_BYTES: u64 = 10 * 1024 * 1024;
+pub const PROCESS_LOG_TRUNCATION_NOTICE: &str = "[taskgraph: process log capture truncated]";
 
 const INSERT_PROCESS_RUN: &str = r#"
 INSERT INTO process_runs (
@@ -195,6 +200,9 @@ pub struct ProcessLogs {
     pub run_id: String,
     pub stdout: Option<String>,
     pub stderr: Option<String>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub max_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -204,6 +212,40 @@ struct OutboxRow {
     target_url: String,
     payload: String,
     attempts: i32,
+    lease_id: String,
+}
+
+pub fn process_launch_enabled() -> bool {
+    matches!(
+        std::env::var("TASKGRAPH_ENABLE_PROCESS_LAUNCH")
+            .unwrap_or_default()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub fn process_runner_stale_after() -> Duration {
+    let configured = std::env::var("TASKGRAPH_PROCESS_RUNNER_STALE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .filter(|ms| *ms >= 1_000)
+        .unwrap_or(DEFAULT_PROCESS_RUNNER_STALE_MS);
+    Duration::milliseconds(configured)
+}
+
+pub fn process_log_capture_limit_bytes() -> u64 {
+    std::env::var("TASKGRAPH_PROCESS_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROCESS_LOG_CAPTURE_MAX_BYTES)
+}
+
+fn process_log_read_limit_bytes() -> u64 {
+    std::env::var("TASKGRAPH_PROCESS_LOG_READ_MAX_BYTES")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .unwrap_or(DEFAULT_PROCESS_LOG_READ_MAX_BYTES)
 }
 
 fn row_to_process_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessRun> {
@@ -480,6 +522,21 @@ pub fn spawn_process_runner(db: &Database, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn spawn_process_runner_or_mark_failed(db: &Database, run_id: &str) -> Result<()> {
+    if let Err(err) = spawn_process_runner(db, run_id) {
+        let _ = mark_process_terminal(
+            db,
+            run_id,
+            "failed",
+            None,
+            None,
+            &format!("runner_spawn_error:{err}"),
+        );
+        return Err(err);
+    }
+    Ok(())
+}
+
 pub fn get_process_run(db: &Database, run_id: &str) -> Result<ProcessRun> {
     let conn = db.lock()?;
     let mut stmt = conn.prepare(SELECT_PROCESS_RUN)?;
@@ -534,7 +591,10 @@ pub fn mark_process_started(
         let changed = conn.execute(
             r#"
             UPDATE process_runs
-            SET status = 'running',
+            SET status = CASE
+                    WHEN status = 'kill_requested' THEN 'kill_requested'
+                    ELSE 'running'
+                END,
                 pid = ?2,
                 runner_pid = ?3,
                 started_at = ?4,
@@ -543,7 +603,7 @@ pub fn mark_process_started(
                 stderr_path = ?6,
                 updated_at = ?4
             WHERE id = ?1
-              AND status = 'created';
+              AND status IN ('created', 'kill_requested');
             "#,
             params![run_id, pid, runner_pid, &now, stdout_path, stderr_path],
         )?;
@@ -699,10 +759,6 @@ pub fn request_process_kill(db: &Database, run_id: &str) -> Result<ProcessRun> {
     if is_terminal_status(&run.status) {
         return Ok(run);
     }
-    let pid = run
-        .pid
-        .ok_or_else(|| anyhow!("process run {run_id} has no child pid yet"))?;
-    kill_pid(pid)?;
     let now = sleep_dt_to_sql(now_utc_naive());
     {
         let conn = db.lock()?;
@@ -711,31 +767,144 @@ pub fn request_process_kill(db: &Database, run_id: &str) -> Result<ProcessRun> {
             params![run_id, now],
         )?;
     }
+    if let Some(pid) = run.pid {
+        let _ = terminate_pid(pid);
+    }
     get_process_run(db, run_id)
 }
 
-fn kill_pid(pid: i64) -> Result<()> {
+pub fn request_process_kill_for_task(db: &Database, task_id: &str) -> Result<usize> {
+    let run_ids = {
+        let conn = db.lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id
+            FROM process_runs
+            WHERE task_id = ?1
+              AND status NOT IN ('succeeded', 'failed', 'killed', 'stuck');
+            "#,
+        )?;
+        let mut rows = stmt.query(params![task_id])?;
+        let mut run_ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            run_ids.push(row.get::<_, String>(0)?);
+        }
+        run_ids
+    };
+
+    let mut requested = 0usize;
+    for run_id in run_ids {
+        let before = get_process_run(db, &run_id)?;
+        let after = request_process_kill(db, &run_id)?;
+        if before.status != after.status || after.status == "kill_requested" {
+            requested += 1;
+        }
+    }
+    Ok(requested)
+}
+
+fn terminate_pid(pid: i64) -> Result<()> {
+    signal_pid(pid, "-TERM")
+}
+
+fn force_kill_pid(pid: i64) -> Result<()> {
+    signal_pid(pid, "-KILL")
+}
+
+fn signal_pid(pid: i64, signal: &str) -> Result<()> {
     #[cfg(unix)]
     {
         let status = Command::new("kill")
-            .arg("-TERM")
+            .arg(signal)
             .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?;
         if status.success() {
             Ok(())
         } else {
-            Err(anyhow!("failed to send TERM to pid {pid}"))
+            Err(anyhow!("failed to send {signal} to pid {pid}"))
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = signal;
         let _ = pid;
         Err(anyhow!("process kill is not supported on this platform"))
     }
 }
 
+fn pid_is_alive(pid: i64) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, "succeeded" | "failed" | "killed" | "stuck")
+}
+
+pub fn reap_stale_process_runs(db: &Database, stale_after: Duration) -> Result<usize> {
+    let now = now_utc_naive();
+    let runs = list_process_runs(db, ProcessRunFilters::default())?;
+    let mut reaped = 0usize;
+
+    for run in runs {
+        if is_terminal_status(&run.status) {
+            continue;
+        }
+        let reference = run
+            .last_heartbeat_at
+            .or(run.started_at)
+            .unwrap_or(run.created_at);
+        if now - reference < stale_after {
+            continue;
+        }
+
+        let terminal = match run.status.as_str() {
+            "created" => mark_process_terminal(db, &run.id, "stuck", None, None, "runner_missing")?,
+            "kill_requested" => {
+                if let Some(pid) = run.pid {
+                    if pid_is_alive(pid) {
+                        let _ = force_kill_pid(pid);
+                    }
+                }
+                mark_process_terminal(db, &run.id, "killed", None, None, "kill_requested")?
+            }
+            _ => {
+                if let Some(pid) = run.pid {
+                    if pid_is_alive(pid) {
+                        let _ = force_kill_pid(pid);
+                    }
+                }
+                let reason = if run.runner_pid.map(pid_is_alive).unwrap_or(false) {
+                    "runner_unresponsive"
+                } else {
+                    "observer_lost"
+                };
+                mark_process_terminal(db, &run.id, "stuck", None, None, reason)?
+            }
+        };
+
+        if is_terminal_status(&terminal.status) {
+            reaped += 1;
+        }
+    }
+
+    Ok(reaped)
 }
 
 fn mark_process_wait_due(
@@ -768,12 +937,13 @@ fn mark_process_wait_due(
                 UPDATE tasks
                 SET sleep_until = ?3,
                     wake_emitted_at = ?3,
+                    sleep_reason = ?4,
                     updated_at = ?3
                 WHERE id = ?1
                   AND status = 'sleeping'
                   AND sleep_id = ?2;
                 "#,
-                params![&run.task_id, &run.wait_id, &now],
+                params![&run.task_id, &run.wait_id, &now, reason],
             )?;
         }
     }
@@ -875,20 +1045,54 @@ fn enqueue_notification(
 }
 
 pub fn dispatch_due_notifications(db: &Database, limit: usize) -> Result<usize> {
-    let now = sleep_dt_to_sql(now_utc_naive());
+    if limit == 0 {
+        return Ok(0);
+    }
+    let now_dt = now_utc_naive();
+    let now = sleep_dt_to_sql(now_dt);
+    let stale_lease_before = sleep_dt_to_sql(now_dt - Duration::seconds(60));
+    let lease_id = generate_id("lease");
     let rows = {
-        let conn = db.lock()?;
-        let mut stmt = conn.prepare(
+        let mut conn = db.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
             r#"
-            SELECT id, event_id, target_url, payload, attempts
+            UPDATE notification_outbox
+            SET status = 'pending',
+                lease_id = NULL,
+                updated_at = ?1
+            WHERE status = 'dispatching'
+              AND updated_at < ?2;
+            "#,
+            params![&now, &stale_lease_before],
+        )?;
+        tx.execute(
+            r#"
+            UPDATE notification_outbox
+            SET status = 'dispatching',
+                lease_id = ?1,
+                updated_at = ?2
+            WHERE id IN (
+                SELECT id
+                FROM notification_outbox
+                WHERE status = 'pending'
+                  AND next_attempt_at <= ?2
+                ORDER BY id ASC
+                LIMIT ?3
+            );
+            "#,
+            params![&lease_id, &now, limit as i64],
+        )?;
+        let mut stmt = tx.prepare(
+            r#"
+            SELECT id, event_id, target_url, payload, attempts, lease_id
             FROM notification_outbox
-            WHERE status = 'pending'
-              AND next_attempt_at <= ?1
-            ORDER BY id ASC
-            LIMIT ?2;
+            WHERE status = 'dispatching'
+              AND lease_id = ?1
+            ORDER BY id ASC;
             "#,
         )?;
-        let mut rows = stmt.query(params![&now, limit as i64])?;
+        let mut rows = stmt.query(params![&lease_id])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(OutboxRow {
@@ -897,8 +1101,12 @@ pub fn dispatch_due_notifications(db: &Database, limit: usize) -> Result<usize> 
                 target_url: row.get(2)?,
                 payload: row.get(3)?,
                 attempts: row.get(4)?,
+                lease_id: row.get(5)?,
             });
         }
+        drop(rows);
+        drop(stmt);
+        tx.commit()?;
         out
     };
 
@@ -908,11 +1116,13 @@ pub fn dispatch_due_notifications(db: &Database, limit: usize) -> Result<usize> 
             Ok(()) => {
                 let now = sleep_dt_to_sql(now_utc_naive());
                 let conn = db.lock()?;
-                conn.execute(
-                    "UPDATE notification_outbox SET status = 'delivered', attempts = attempts + 1, updated_at = ?2 WHERE id = ?1",
-                    params![row.id, now],
+                let changed = conn.execute(
+                    "UPDATE notification_outbox SET status = 'delivered', lease_id = NULL, attempts = attempts + 1, updated_at = ?3 WHERE id = ?1 AND lease_id = ?2",
+                    params![row.id, &row.lease_id, now],
                 )?;
-                delivered += 1;
+                if changed > 0 {
+                    delivered += 1;
+                }
             }
             Err(err) => {
                 let next_attempts = row.attempts + 1;
@@ -931,11 +1141,13 @@ pub fn dispatch_due_notifications(db: &Database, limit: usize) -> Result<usize> 
                     r#"
                     UPDATE notification_outbox
                     SET status = ?2,
+                        lease_id = NULL,
                         attempts = ?3,
                         next_attempt_at = ?4,
                         last_error = ?5,
                         updated_at = ?6
-                    WHERE id = ?1;
+                    WHERE id = ?1
+                      AND lease_id = ?7;
                     "#,
                     params![
                         row.id,
@@ -944,6 +1156,7 @@ pub fn dispatch_due_notifications(db: &Database, limit: usize) -> Result<usize> 
                         next,
                         err.to_string(),
                         now,
+                        &row.lease_id,
                     ],
                 )?;
             }
@@ -970,19 +1183,45 @@ fn send_callback(row: &OutboxRow) -> Result<()> {
 
 pub fn get_process_logs(db: &Database, run_id: &str) -> Result<ProcessLogs> {
     let run = get_process_run(db, run_id)?;
-    let stdout = read_optional_path(run.stdout_path.as_deref())?;
-    let stderr = read_optional_path(run.stderr_path.as_deref())?;
+    let max_bytes = process_log_read_limit_bytes();
+    let stdout = read_optional_path(run.stdout_path.as_deref(), max_bytes)?;
+    let stderr = read_optional_path(run.stderr_path.as_deref(), max_bytes)?;
     Ok(ProcessLogs {
         run_id: run.id,
-        stdout,
-        stderr,
+        stdout: stdout.content,
+        stderr: stderr.content,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+        max_bytes,
     })
 }
 
-fn read_optional_path(path: Option<&str>) -> Result<Option<String>> {
+struct LogRead {
+    content: Option<String>,
+    truncated: bool,
+}
+
+fn read_optional_path(path: Option<&str>, max_bytes: u64) -> Result<LogRead> {
     match path {
-        Some(path) if Path::new(path).exists() => Ok(Some(fs::read_to_string(path)?)),
-        _ => Ok(None),
+        Some(path) if Path::new(path).exists() => {
+            let mut file = File::open(path)?;
+            let len = file.metadata()?.len();
+            let truncated = len > max_bytes;
+            if truncated {
+                file.seek(SeekFrom::Start(len - max_bytes))?;
+            }
+            let mut bytes = Vec::new();
+            file.take(max_bytes).read_to_end(&mut bytes)?;
+            let content = String::from_utf8_lossy(&bytes).to_string();
+            Ok(LogRead {
+                truncated: truncated || content.contains(PROCESS_LOG_TRUNCATION_NOTICE),
+                content: Some(content),
+            })
+        }
+        _ => Ok(LogRead {
+            content: None,
+            truncated: false,
+        }),
     }
 }
 

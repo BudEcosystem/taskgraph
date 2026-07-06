@@ -30,9 +30,12 @@ pub use notes::{add_note, list_notes};
 pub use processes::{
     dispatch_due_notifications, get_process_logs, get_process_run, launch_process_run,
     list_process_hooks, list_process_runs, mark_process_heartbeat, mark_process_hook_matched,
-    mark_process_output, mark_process_started, mark_process_terminal, process_log_dir,
-    request_process_kill, spawn_process_runner, ProcessHookSpec, ProcessLaunchRequest,
-    ProcessLaunchResult, ProcessLogs, ProcessRun, ProcessRunFilters, TaskWait,
+    mark_process_output, mark_process_started, mark_process_terminal, process_launch_enabled,
+    process_log_capture_limit_bytes, process_log_dir, process_runner_stale_after,
+    reap_stale_process_runs, request_process_kill, request_process_kill_for_task,
+    spawn_process_runner, spawn_process_runner_or_mark_failed, ProcessHook, ProcessHookSpec,
+    ProcessLaunchRequest, ProcessLaunchResult, ProcessLogs, ProcessRun, ProcessRunFilters,
+    TaskWait, PROCESS_LOG_TRUNCATION_NOTICE,
 };
 pub use projects::{
     create_project, fuzzy_find_project, get_project, list_projects, update_project_status,

@@ -102,7 +102,7 @@ fn print_prompt_mcp() {
 }}
 
 # Option 2: HTTP (remote — connect to running server)
-# First: taskgraph serve --port 8484
+# First: taskgraph serve --port 8484 --enable-process-launch
 {{
   "mcpServers": {{
     "taskgraph": {{
@@ -130,7 +130,7 @@ prerequisites are complete.
 2. Add tasks with dependencies — each task declares which tasks must finish first
 3. Claim work: `taskgraph_go` returns the next ready task with handoff context from completed upstream tasks
 4. Sleep when waiting: `taskgraph_task_sleep` stores a resume state ref and releases the agent until a wake time
-5. Observe processes: `taskgraph_process_launch` launches a child process and wakes/calls back on hook, exit, kill, or stuck
+5. Observe processes: `taskgraph_process_launch` launches a child process and wakes/calls back on hook, exit, kill, or stuck. It requires `TASKGRAPH_ENABLE_PROCESS_LAUNCH=1`.
 6. Resume when due: `taskgraph_wakes_due` or `task_wake_due` identifies due sleeps/process waits, then `taskgraph_task_resume` returns the saved state ref
 7. Complete + advance: `taskgraph_done` marks complete, `taskgraph_go` gets the next one
 8. Check progress: `taskgraph_status` shows done/total/ready/running/sleeping counts
@@ -146,7 +146,7 @@ prerequisites are complete.
 - Dependency types: `feeds_into` (default), `blocks`, `suggests`
 - Task kinds: `generic`, `code`, `research`, `review`, `test`, `shell`
 - Durable sleep: agents can sleep owned work with an opaque `state_ref`; taskgraph keeps the current `agent_id` and emits `task_wake_due`
-- Process observation: `taskgraph_process_launch` creates a durable wait and observes stdout/stderr hooks plus terminal process states
+- Process observation: `taskgraph_process_launch` creates a durable wait and observes stdout/stderr hooks plus terminal process states. It is disabled unless `TASKGRAPH_ENABLE_PROCESS_LAUNCH=1`.
 - IDs are short 8-char strings (e.g. `t-a1b2c3d4`)
 - Fuzzy matching: misspell a task ID and taskgraph suggests the closest match
 - Use `--compact` flag on tools for token-efficient output"#

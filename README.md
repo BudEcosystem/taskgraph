@@ -270,8 +270,9 @@ taskgraph process launch t-k9x2pq \
 
 `process launch` creates a `process_run`, creates a process `task_wait`, moves the
 task to `sleeping`, and starts a detached taskgraph runner. The runner launches
-the child process, captures stdout/stderr logs, watches configured hooks, records
-exit/killed/stuck states, and dispatches callback notifications from SQLite.
+the child process, captures bounded stdout/stderr logs, watches configured hooks,
+records exit/killed/stuck states, and dispatches callback notifications through
+the SQLite outbox.
 
 When a hook or terminal process state happens, taskgraph marks the wait due and
 exposes it through the same wake/resume flow:
@@ -282,10 +283,23 @@ taskgraph resume t-k9x2pq --agent trainer-1 --sleep-id w-a1b2c3
 ```
 
 Callbacks are delivered at least once with an `Idempotency-Key` header of
-`taskgraph:event:<event_id>`. Agents should make callback handlers idempotent.
-HTTP process launch is disabled by default; start the server with
-`taskgraph serve --enable-process-launch` if remote clients should be allowed to
-launch local processes.
+`taskgraph:event:<event_id>`. The outbox leases callback rows before dispatch so
+multiple taskgraph processes do not intentionally send the same pending callback
+at the same time, but callback consumers should still be idempotent because
+network failures can make any at-least-once delivery ambiguous.
+
+If the detached runner stops heartbeating, `taskgraph serve` marks the process
+wait due instead of leaving the task asleep forever. A stale runner that never
+started becomes `stuck` with reason `runner_missing`; a lost observer becomes
+`stuck` with reason `observer_lost` or `runner_unresponsive`; a stale kill request
+becomes `killed`. Taskgraph kills an orphan child process when it can, because it
+can no longer truthfully observe hooks or exit status after the observer is lost.
+
+Remote process launch is disabled by default. Start the HTTP server with
+`taskgraph serve --enable-process-launch` to allow `POST /api/tasks/{id}/processes`
+and HTTP MCP process launch. For stdio MCP, set
+`TASKGRAPH_ENABLE_PROCESS_LAUNCH=1` only when that local MCP client is trusted to
+run commands on the host.
 
 ## Interfaces
 
@@ -641,6 +655,10 @@ taskgraph task create-batch --file tasks.yaml
 | --- | --- | --- |
 | `--db <PATH>` | `.taskgraph.db` | Database path for this command. |
 | `TASKGRAPH_DB` | unset | Database path used when `--db` is omitted. |
+| `TASKGRAPH_ENABLE_PROCESS_LAUNCH` | unset | Enables process launch through MCP; HTTP also requires `serve --enable-process-launch`. |
+| `TASKGRAPH_PROCESS_RUNNER_STALE_MS` | `15000` | Heartbeat grace window before a process runner is considered lost. Minimum accepted value is `1000`. |
+| `TASKGRAPH_PROCESS_LOG_MAX_BYTES` | `10485760` | Max captured log bytes per process stream before the runner truncates capture. |
+| `TASKGRAPH_PROCESS_LOG_READ_MAX_BYTES` | `262144` | Max bytes returned per stream by `process logs`; larger files return the tail with truncation flags. |
 | `RUST_LOG` | unset | Logging filter, for example `info` or `debug`. |
 | `NO_COLOR` | unset | Disable colored terminal output when set. |
 | `INSTALL_DIR` | `/usr/local/bin` | Install location used by `install.sh`. |
@@ -652,8 +670,8 @@ taskgraph task create-batch --file tasks.yaml
 - WAL mode is enabled so readers can continue while another process writes.
 - Atomic claims rely on SQLite write serialization.
 - `taskgraph serve` runs the background sweeper. It promotes ready tasks,
-  reclaims stale work, handles timeouts, and emits near-exact `task_wake_due`
-  events for sleeping tasks.
+  reclaims stale work, handles timeouts, reaps stale process observers, dispatches
+  due callbacks, and emits near-exact `task_wake_due` events for sleeping tasks.
 - Without relying on background wake events, durable sleep state is still stored
   in SQLite and can be discovered with `taskgraph wakes due`. HTTP clients can
   use `GET /api/wakes/due` when the server is running.

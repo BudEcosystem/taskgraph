@@ -1,8 +1,8 @@
 use crate::cli::{print_json, resolve_project_id};
 use crate::db::{
     get_process_logs, get_process_run, launch_process_run, list_process_runs,
-    parse_sleep_duration_ms, request_process_kill, spawn_process_runner, Database, ProcessHookSpec,
-    ProcessLaunchRequest, ProcessRunFilters,
+    parse_sleep_duration_ms, request_process_kill, spawn_process_runner_or_mark_failed, Database,
+    ProcessHookSpec, ProcessLaunchRequest, ProcessRunFilters,
 };
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -118,7 +118,7 @@ fn launch_cmd(db: &Database, args: ProcessLaunchArgs, json: bool, compact: bool)
             timeout_ms,
         },
     )?;
-    spawn_process_runner(db, &result.run.id)?;
+    spawn_process_runner_or_mark_failed(db, &result.run.id)?;
 
     if json {
         if compact {

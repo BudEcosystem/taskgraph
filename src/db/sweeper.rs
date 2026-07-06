@@ -1,5 +1,5 @@
 use crate::db::tasks::{emit_due_wakes, promote_ready_tasks};
-use crate::db::{dt_to_sql, Database};
+use crate::db::{dt_to_sql, process_runner_stale_after, reap_stale_process_runs, Database};
 use crate::models::{EventType, RetryBackoff};
 use anyhow::Result;
 use chrono::Duration;
@@ -94,6 +94,7 @@ pub struct SweepResult {
     pub retried: usize,
     pub composites_completed: usize,
     pub wakes_emitted: usize,
+    pub processes_reaped: usize,
 }
 
 fn retry_delay_ms(base_delay: i64, backoff: RetryBackoff, retry_count: i32) -> i64 {
@@ -114,6 +115,7 @@ pub fn run_sweep(db: &Database) -> Result<SweepResult> {
         wakes_emitted: emit_due_wakes(db)?.len(),
         ..Default::default()
     };
+    result.processes_reaped = reap_stale_process_runs(db, process_runner_stale_after())?;
 
     {
         let conn = db.lock()?;
