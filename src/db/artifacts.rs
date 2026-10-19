@@ -1,4 +1,4 @@
-use crate::db::{dt_to_sql, json_text, json_to_sql, parse_dt, parse_json, Database};
+use crate::db::{dt_to_sql, json_to_sql, parse_dt, parse_json, Database};
 use crate::models::Artifact;
 use anyhow::Result;
 use rusqlite::params;
@@ -40,7 +40,7 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Artifact> {
             )),
         )
     };
-    let metadata = json_text(row, 8)?;
+    let metadata: Option<String> = row.get(8)?;
     Ok(Artifact {
         id: row.get(0)?,
         task_id: row.get(1)?,

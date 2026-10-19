@@ -1,6 +1,6 @@
 use crate::db::dependencies::{add_dependency, remove_dependency};
 use crate::db::{
-    dt_to_sql, json_text, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql,
+    dt_to_sql, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql,
     truncate_to_millis, Database, TaskgraphError,
 };
 use crate::models::{generate_id, EventType, RetryBackoff, Task, TaskKind, TaskStatus};
@@ -383,12 +383,12 @@ pub(crate) fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let claimed_at: Option<String> = row.get(10)?;
     let started_at: Option<String> = row.get(11)?;
     let completed_at: Option<String> = row.get(12)?;
-    let result = json_text(row, 13)?;
+    let result: Option<String> = row.get(13)?;
     let last_heartbeat: Option<String> = row.get(23)?;
     let sleep_until: Option<String> = row.get(25)?;
-    let sleep_state_ref = json_text(row, 26)?;
+    let sleep_state_ref: Option<String> = row.get(26)?;
     let wake_emitted_at: Option<String> = row.get(28)?;
-    let metadata = json_text(row, 33)?;
+    let metadata: Option<String> = row.get(33)?;
     Ok(Task {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -1036,7 +1036,7 @@ pub fn list_due_wakes(db: &Database, project_id: Option<&str>) -> Result<Vec<Due
     while let Some(row) = rows.next()? {
         let sleep_id: Option<String> = row.get(3)?;
         let sleep_until: String = row.get(4)?;
-        let state_ref = json_text(row, 5)?;
+        let state_ref: Option<String> = row.get(5)?;
         let wake_emitted_at: Option<String> = row.get(7)?;
         wakes.push(DueWake {
             task_id: row.get(0)?,
@@ -1087,7 +1087,7 @@ pub fn emit_due_wakes(db: &Database) -> Result<Vec<DueWake>> {
     let mut rows = stmt.query(params![now_s.clone()])?;
     let mut wakes = Vec::new();
     while let Some(row) = rows.next()? {
-        let state_ref_raw = json_text(row, 5)?;
+        let state_ref_raw: Option<String> = row.get(5)?;
         let sleep_until: String = row.get(4)?;
         let state_ref = parse_json(state_ref_raw)?;
         wakes.push(DueWake {
@@ -1265,7 +1265,7 @@ pub fn get_handoff_context(db: &Database, task_id: &str) -> Result<Vec<HandoffEn
     let mut rows = stmt.query(params![task_id])?;
     let mut entries = Vec::new();
     while let Some(row) = rows.next()? {
-        let result_raw = json_text(row, 2)?;
+        let result_raw: Option<String> = row.get(2)?;
         entries.push(HandoffEntry {
             from_task_id: row.get(0)?,
             from_title: row.get(1)?,

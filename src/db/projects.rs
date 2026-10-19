@@ -1,6 +1,5 @@
 use crate::db::{
-    dt_to_sql, json_text, json_to_sql, now_utc_naive, parse_dt, parse_json, Database,
-    TaskgraphError,
+    dt_to_sql, json_to_sql, now_utc_naive, parse_dt, parse_json, Database, TaskgraphError,
 };
 use crate::models::{generate_id, Project, ProjectStatus};
 use anyhow::Result;
@@ -70,7 +69,7 @@ WHERE id = ?1;
 "#;
 
 fn row_to_project(row: &rusqlite::Row<'_>) -> Result<Project> {
-    let metadata = json_text(row, 5)?;
+    let metadata: Option<String> = row.get(5)?;
     Ok(Project {
         id: row.get(0)?,
         user_id: row.get(1)?,

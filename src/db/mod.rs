@@ -129,18 +129,6 @@ pub(crate) fn json_to_sql(value: &Option<Value>) -> Result<Option<String>> {
     }
 }
 
-/// Reads a `JSON` column as text. The type name gives the column NUMERIC affinity, so SQLite stores a numeric
-/// JSON value as INTEGER or REAL, and reading it as `String` fails.
-pub(crate) fn json_text(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
-    use rusqlite::types::ValueRef;
-    Ok(match row.get_ref(idx)? {
-        ValueRef::Null => None,
-        ValueRef::Integer(i) => Some(i.to_string()),
-        ValueRef::Real(f) => Some(f.to_string()),
-        ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
-    })
-}
-
 pub(crate) fn parse_json(value: Option<String>) -> Result<Option<Value>> {
     match value {
         Some(v) => Ok(Some(serde_json::from_str(&v)?)),

@@ -1,4 +1,4 @@
-use crate::db::{dt_to_sql, json_text, json_to_sql, parse_dt, parse_json, Database};
+use crate::db::{dt_to_sql, json_to_sql, parse_dt, parse_json, Database};
 use crate::models::{Event, EventType};
 use anyhow::Result;
 use chrono::NaiveDateTime;
@@ -44,7 +44,7 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             )),
         )
     };
-    let payload = json_text(row, 5)?;
+    let payload: Option<String> = row.get(5)?;
     Ok(Event {
         id: row.get(0)?,
         task_id: row.get(1)?,

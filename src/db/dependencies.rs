@@ -1,4 +1,4 @@
-use crate::db::{json_text, json_to_sql, parse_json, Database};
+use crate::db::{json_to_sql, parse_json, Database};
 use crate::models::{Dependency, DependencyCondition, DependencyKind};
 use anyhow::Result;
 use rusqlite::params;
@@ -42,7 +42,7 @@ fn row_to_dependency(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dependency> {
             )),
         )
     };
-    let metadata = json_text(row, 5)?;
+    let metadata: Option<String> = row.get(5)?;
     Ok(Dependency {
         id: row.get(0)?,
         from_task: row.get(1)?,

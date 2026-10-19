@@ -1,6 +1,6 @@
 use crate::db::{
-    get_task, json_text, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql,
-    Database, TaskgraphError,
+    get_task, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql, Database,
+    TaskgraphError,
 };
 use crate::models::{generate_id, Event, EventType, TaskStatus};
 use anyhow::{anyhow, Result};
@@ -264,7 +264,7 @@ fn row_to_process_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessRun> {
     let ended_at: Option<String> = row.get(11)?;
     let last_heartbeat_at: Option<String> = row.get(12)?;
     let last_output_at: Option<String> = row.get(13)?;
-    let state_ref = json_text(row, 22)?;
+    let state_ref: Option<String> = row.get(22)?;
     Ok(ProcessRun {
         id: row.get(0)?,
         task_id: row.get(1)?,
@@ -340,7 +340,7 @@ fn row_to_task_wait(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskWait> {
             )),
         )
     };
-    let state_ref = json_text(row, 7)?;
+    let state_ref: Option<String> = row.get(7)?;
     let due_at: Option<String> = row.get(9)?;
     let resumed_at: Option<String> = row.get(10)?;
     Ok(TaskWait {
