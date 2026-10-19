@@ -1174,3 +1174,47 @@ fn numeric_metadata_reads_back() {
         Some(json!(42))
     );
 }
+
+#[test]
+fn add_with_unknown_dependency_creates_nothing() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "AtomicAdd", None, None, None).unwrap();
+
+    let err = create_task_with_deps(
+        &db,
+        &make_task(&project.id, "orphan", TaskStatus::Pending),
+        &["tag-a".to_owned()],
+        &[("t-bogus1".to_owned(), DependencyKind::FeedsInto)],
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("t-bogus1"), "{err}");
+    assert!(project_tasks(&db, &project.id).is_empty());
+}
+
+#[test]
+fn batch_with_unknown_dependency_creates_nothing() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "AtomicBatch", None, None, None).unwrap();
+    let first = make_task(&project.id, "first", TaskStatus::Pending);
+    let second = make_task(&project.id, "second", TaskStatus::Pending);
+    let edges = vec![
+        (
+            first.id.clone(),
+            second.id.clone(),
+            DependencyKind::FeedsInto,
+        ),
+        (
+            "t-bogus2".to_owned(),
+            second.id.clone(),
+            DependencyKind::FeedsInto,
+        ),
+    ];
+
+    let err = batch_create_tasks_with_edges(&db, &[first, second], &[], &edges).unwrap_err();
+
+    assert!(err.to_string().contains("t-bogus2"), "{err}");
+    assert!(project_tasks(&db, &project.id).is_empty());
+}

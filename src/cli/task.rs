@@ -4,13 +4,13 @@ use crate::cli::{
 };
 use crate::db::{
     add_dependency, add_note, add_task_files, amend_task_description, approve_task,
-    batch_create_tasks, cancel_task, check_file_conflicts, claim_next_task, claim_task,
-    complete_task, compute_effects, create_task, fail_task, fuzzy_find_task, get_handoff_context,
-    get_lookahead, get_task, insert_task_between, list_dependencies, list_due_wakes, list_notes,
-    list_task_files, list_tasks, parse_sleep_duration_ms, pause_task, pivot_subtree, project_state,
-    promote_ready_tasks, remove_dependency, resume_task, sleep_task, snapshot_task_statuses,
-    split_task, start_task, update_heartbeat, update_progress, update_task, Database, NewSubtask,
-    SplitPart, TaskListFilters, TaskgraphError,
+    batch_create_tasks_with_edges, cancel_task, check_file_conflicts, claim_next_task, claim_task,
+    complete_task, compute_effects, create_task, create_task_with_deps, fail_task, fuzzy_find_task,
+    get_handoff_context, get_lookahead, get_task, insert_task_between, list_dependencies,
+    list_due_wakes, list_notes, list_task_files, list_tasks, parse_sleep_duration_ms, pause_task,
+    pivot_subtree, project_state, promote_ready_tasks, remove_dependency, resume_task, sleep_task,
+    snapshot_task_statuses, split_task, start_task, update_heartbeat, update_progress, update_task,
+    Database, NewSubtask, SplitPart, TaskListFilters, TaskgraphError,
 };
 use crate::models::{
     generate_id, DependencyCondition, DependencyKind, RetryBackoff, Task, TaskKind, TaskStatus,
@@ -1056,18 +1056,12 @@ pub fn create_task_cmd(
         updated_at: now,
     };
 
-    let created = create_task(db, &task, &args.tags)?;
-    for dep in &args.deps {
-        let (from_task, kind) = parse_dep_arg(dep)?;
-        add_dependency(
-            db,
-            &from_task,
-            &created.id,
-            kind,
-            DependencyCondition::All,
-            None,
-        )?;
-    }
+    let deps = args
+        .deps
+        .iter()
+        .map(|dep| parse_dep_arg(dep))
+        .collect::<Result<Vec<_>>>()?;
+    let created = create_task_with_deps(db, &task, &args.tags, &deps)?;
     let _ = promote_ready_tasks(db)?;
 
     if json {
@@ -1145,35 +1139,25 @@ fn create_batch_cmd(db: &Database, args: CreateBatchArgs, json: bool) -> Result<
         });
     }
 
-    let inserted = batch_create_tasks(db, &tasks)?;
-
+    let mut edges = Vec::new();
+    let mut tags = Vec::new();
     for (task_id, spec) in &task_specs {
-        if let Some(deps) = &spec.deps {
-            for dep in deps {
-                let from_task = id_aliases
-                    .get(&dep.from)
-                    .cloned()
-                    .unwrap_or_else(|| dep.from.clone());
-                add_dependency(
-                    db,
-                    &from_task,
-                    task_id,
-                    dep.kind.clone().unwrap_or(DependencyKind::FeedsInto),
-                    DependencyCondition::All,
-                    None,
-                )?;
-            }
+        for dep in spec.deps.iter().flatten() {
+            let from_task = id_aliases
+                .get(&dep.from)
+                .cloned()
+                .unwrap_or_else(|| dep.from.clone());
+            edges.push((
+                from_task,
+                task_id.clone(),
+                dep.kind.clone().unwrap_or(DependencyKind::FeedsInto),
+            ));
         }
-        if let Some(tags) = &spec.tags {
-            let conn = db.lock()?;
-            for tag in tags {
-                conn.execute(
-                    "INSERT OR IGNORE INTO task_tags(task_id, tag) VALUES (?1, ?2)",
-                    rusqlite::params![task_id, tag],
-                )?;
-            }
+        for tag in spec.tags.iter().flatten() {
+            tags.push((task_id.clone(), tag.clone()));
         }
     }
+    let inserted = batch_create_tasks_with_edges(db, &tasks, &tags, &edges)?;
 
     let _ = promote_ready_tasks(db)?;
 

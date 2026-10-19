@@ -797,6 +797,18 @@ assert_contains "object result is shown downstream" '{"sum":5}' "$OBJ_OUT"
 echo ""
 
 # ─────────────────────────────────────────────
+echo "ATOMIC ADD"
+
+ADD_BEFORE=$(jq_len "$($TASKGRAPH --db "$DB" --json list --project "$RT_PROJECT_ID")")
+ADD_EXIT=0
+ADD_OUT=$($TASKGRAPH --db "$DB" add --project "$RT_PROJECT_ID" --title "Orphan" --dep t-bogus1 2>&1) || ADD_EXIT=$?
+assert_regex "add with an unknown dependency fails" "^[1-9]" "$ADD_EXIT"
+assert_contains "add names the unknown dependency" "t-bogus1" "$ADD_OUT"
+assert_eq "add with an unknown dependency creates nothing" "$ADD_BEFORE" "$(jq_len "$($TASKGRAPH --db "$DB" --json list --project "$RT_PROJECT_ID")")"
+
+echo ""
+
+# ─────────────────────────────────────────────
 # SUMMARY
 echo "=========================================="
 echo "  RESULTS"
