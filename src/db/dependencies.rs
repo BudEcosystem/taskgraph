@@ -3,7 +3,7 @@ use crate::models::{Dependency, DependencyCondition, DependencyKind};
 use anyhow::Result;
 use rusqlite::params;
 
-pub(crate) const INSERT_DEPENDENCY: &str = r#"
+const INSERT_DEPENDENCY: &str = r#"
 INSERT INTO dependencies(from_task, to_task, kind, condition, metadata)
 VALUES (?1, ?2, ?3, ?4, ?5);
 "#;

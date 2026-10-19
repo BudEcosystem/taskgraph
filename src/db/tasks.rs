@@ -1,15 +1,12 @@
-use crate::db::dependencies::{add_dependency, remove_dependency, INSERT_DEPENDENCY};
+use crate::db::dependencies::{add_dependency, remove_dependency};
 use crate::db::{
     dt_to_sql, json_text, json_to_sql, now_utc_naive, parse_dt, parse_json, sleep_dt_to_sql,
     truncate_to_millis, Database, TaskgraphError,
 };
-use crate::models::{
-    generate_id, DependencyCondition, DependencyKind, EventType, RetryBackoff, Task, TaskKind,
-    TaskStatus,
-};
+use crate::models::{generate_id, EventType, RetryBackoff, Task, TaskKind, TaskStatus};
 use anyhow::{anyhow, Result};
 use chrono::Duration;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -451,17 +448,7 @@ pub(crate) fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
 }
 
 pub fn create_task(db: &Database, task: &Task, tags: &[String]) -> Result<Task> {
-    create_task_with_deps(db, task, tags, &[])
-}
-
-/// Creates a task with its tags and incoming dependencies in one transaction: a missing dependency task fails the
-/// whole call and leaves nothing behind.
-pub fn create_task_with_deps(
-    db: &Database,
-    task: &Task,
-    tags: &[String],
-    deps: &[(String, DependencyKind)],
-) -> Result<Task> {
+    let conn = db.lock()?;
     let mut task_with_defaults = task.clone();
     if task_with_defaults.max_retries < 0 {
         task_with_defaults.max_retries = 0;
@@ -476,16 +463,53 @@ pub fn create_task_with_deps(
         task_with_defaults.heartbeat_interval = 30;
     }
     let task_id = task_with_defaults.id.clone();
-    let mut conn = db.lock()?;
-    let tx = conn.transaction()?;
-    insert_task_row(&tx, &task_with_defaults)?;
+    let result = json_to_sql(&task_with_defaults.result)?;
+    let sleep_state_ref = json_to_sql(&task_with_defaults.sleep_state_ref)?;
+    let metadata = json_to_sql(&task_with_defaults.metadata)?;
+    conn.execute(
+        INSERT_TASK,
+        params![
+            &task_with_defaults.id,
+            &task_with_defaults.project_id,
+            &task_with_defaults.parent_task_id,
+            task_with_defaults.is_composite,
+            &task_with_defaults.title,
+            &task_with_defaults.description,
+            &task_with_defaults.status,
+            &task_with_defaults.kind,
+            task_with_defaults.priority,
+            &task_with_defaults.agent_id,
+            task_with_defaults.claimed_at.map(dt_to_sql),
+            task_with_defaults.started_at.map(dt_to_sql),
+            task_with_defaults.completed_at.map(dt_to_sql),
+            &result,
+            &task_with_defaults.error,
+            task_with_defaults.progress,
+            &task_with_defaults.progress_note,
+            task_with_defaults.max_retries,
+            task_with_defaults.retry_count,
+            &task_with_defaults.retry_backoff,
+            task_with_defaults.retry_delay_ms,
+            task_with_defaults.timeout_seconds,
+            task_with_defaults.heartbeat_interval,
+            task_with_defaults.last_heartbeat.map(dt_to_sql),
+            &task_with_defaults.sleep_id,
+            task_with_defaults.sleep_until.map(dt_to_sql),
+            &sleep_state_ref,
+            &task_with_defaults.sleep_reason,
+            task_with_defaults.wake_emitted_at.map(dt_to_sql),
+            task_with_defaults.requires_approval,
+            &task_with_defaults.approval_status,
+            &task_with_defaults.approved_by,
+            &task_with_defaults.approval_comment,
+            &metadata,
+            dt_to_sql(task_with_defaults.created_at),
+            dt_to_sql(task_with_defaults.updated_at)
+        ],
+    )?;
     for tag in tags {
-        tx.execute(INSERT_TASK_TAG, params![&task_id, tag])?;
+        conn.execute(INSERT_TASK_TAG, params![&task_id, tag])?;
     }
-    for (from_task, kind) in deps {
-        insert_edge(&tx, from_task, &task_id, kind)?;
-    }
-    tx.commit()?;
     drop(conn);
     let task = get_task(db, &task_id)?;
     let _ = crate::db::insert_event(
@@ -498,86 +522,6 @@ pub fn create_task_with_deps(
         crate::db::now_utc_naive(),
     );
     Ok(task)
-}
-
-fn insert_task_row(conn: &Connection, task: &Task) -> Result<()> {
-    let result = json_to_sql(&task.result)?;
-    let sleep_state_ref = json_to_sql(&task.sleep_state_ref)?;
-    let metadata = json_to_sql(&task.metadata)?;
-    conn.execute(
-        INSERT_TASK,
-        params![
-            &task.id,
-            &task.project_id,
-            &task.parent_task_id,
-            task.is_composite,
-            &task.title,
-            &task.description,
-            &task.status,
-            &task.kind,
-            task.priority,
-            &task.agent_id,
-            task.claimed_at.map(dt_to_sql),
-            task.started_at.map(dt_to_sql),
-            task.completed_at.map(dt_to_sql),
-            &result,
-            &task.error,
-            task.progress,
-            &task.progress_note,
-            task.max_retries,
-            task.retry_count,
-            &task.retry_backoff,
-            task.retry_delay_ms,
-            task.timeout_seconds,
-            task.heartbeat_interval,
-            task.last_heartbeat.map(dt_to_sql),
-            &task.sleep_id,
-            task.sleep_until.map(dt_to_sql),
-            &sleep_state_ref,
-            &task.sleep_reason,
-            task.wake_emitted_at.map(dt_to_sql),
-            task.requires_approval,
-            &task.approval_status,
-            &task.approved_by,
-            &task.approval_comment,
-            &metadata,
-            dt_to_sql(task.created_at),
-            dt_to_sql(task.updated_at)
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_edge(
-    conn: &Connection,
-    from_task: &str,
-    to_task: &str,
-    kind: &DependencyKind,
-) -> Result<()> {
-    let exists: Option<i64> = conn
-        .query_row(
-            "SELECT 1 FROM tasks WHERE id = ?1",
-            params![from_task],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if exists.is_none() {
-        return Err(TaskgraphError::NotFound(format!(
-            "dependency task {from_task}; nothing was created. Check the id with `taskgraph list`"
-        ))
-        .into());
-    }
-    conn.execute(
-        INSERT_DEPENDENCY,
-        params![
-            from_task,
-            to_task,
-            kind,
-            DependencyCondition::All,
-            None::<String>
-        ],
-    )?;
-    Ok(())
 }
 
 pub fn get_task(db: &Database, task_id: &str) -> Result<Task> {
@@ -1333,29 +1277,58 @@ pub fn get_handoff_context(db: &Database, task_id: &str) -> Result<Vec<HandoffEn
 }
 
 pub fn batch_create_tasks(db: &Database, tasks: &[Task]) -> Result<usize> {
-    batch_create_tasks_with_edges(db, tasks, &[], &[])
-}
-
-/// Creates tasks, their tags and their dependencies in one transaction.
-pub fn batch_create_tasks_with_edges(
-    db: &Database,
-    tasks: &[Task],
-    tags: &[(String, String)],
-    edges: &[(String, String, DependencyKind)],
-) -> Result<usize> {
     let mut conn = db.lock()?;
     let tx = conn.transaction()?;
+    let mut inserted = 0usize;
     for task in tasks {
-        insert_task_row(&tx, task)?;
-    }
-    for (task_id, tag) in tags {
-        tx.execute(INSERT_TASK_TAG, params![task_id, tag])?;
-    }
-    for (from_task, to_task, kind) in edges {
-        insert_edge(&tx, from_task, to_task, kind)?;
+        let result = json_to_sql(&task.result)?;
+        let sleep_state_ref = json_to_sql(&task.sleep_state_ref)?;
+        let metadata = json_to_sql(&task.metadata)?;
+        tx.execute(
+            INSERT_TASK,
+            params![
+                &task.id,
+                &task.project_id,
+                &task.parent_task_id,
+                task.is_composite,
+                &task.title,
+                &task.description,
+                &task.status,
+                &task.kind,
+                task.priority,
+                &task.agent_id,
+                task.claimed_at.map(dt_to_sql),
+                task.started_at.map(dt_to_sql),
+                task.completed_at.map(dt_to_sql),
+                &result,
+                &task.error,
+                task.progress,
+                &task.progress_note,
+                task.max_retries,
+                task.retry_count,
+                &task.retry_backoff,
+                task.retry_delay_ms,
+                task.timeout_seconds,
+                task.heartbeat_interval,
+                task.last_heartbeat.map(dt_to_sql),
+                &task.sleep_id,
+                task.sleep_until.map(dt_to_sql),
+                &sleep_state_ref,
+                &task.sleep_reason,
+                task.wake_emitted_at.map(dt_to_sql),
+                task.requires_approval,
+                &task.approval_status,
+                &task.approved_by,
+                &task.approval_comment,
+                &metadata,
+                dt_to_sql(task.created_at),
+                dt_to_sql(task.updated_at)
+            ],
+        )?;
+        inserted += 1;
     }
     tx.commit()?;
-    Ok(tasks.len())
+    Ok(inserted)
 }
 
 /// Returns (task_id, title) pairs for tasks promoted from pending → ready.
