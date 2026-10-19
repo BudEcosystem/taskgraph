@@ -773,8 +773,11 @@ RT_C=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$RT_PROJE
 $TASKGRAPH --db "$DB" go --project "$RT_PROJECT_ID" --agent rt >/dev/null
 NUM_OUT=$($TASKGRAPH --db "$DB" done "$RT_A" --result 500500 --next --agent rt 2>&1)
 assert_contains "numeric result is handed off" "500500" "$NUM_OUT"
+FLOAT_OUT=$($TASKGRAPH --db "$DB" done "$RT_B" --result 6.90 --next --agent rt 2>&1)
+assert_contains "float result keeps its text" "6.90" "$FLOAT_OUT"
 RT_LIST=$($TASKGRAPH --db "$DB" --json list --project "$RT_PROJECT_ID")
 assert_eq "list reads a project holding numeric results" "3" "$(jq_len "$RT_LIST")"
+assert_eq "scalar result is stored as written" "6.90" "$(jq_field "$($TASKGRAPH --db "$DB" --json show "$RT_B")" "result")"
 LONG_RESULT="Größenänderung über alle Prüfungen hinweg — äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß"
 NA_PROJECT_ID=$(jq_field "$($TASKGRAPH --db "$DB" --json project create "non-ascii-results")" "id")
 NA_A=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$NA_PROJECT_ID" --title "NA A")" "id")
