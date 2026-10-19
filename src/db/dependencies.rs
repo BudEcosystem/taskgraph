@@ -1,9 +1,9 @@
-use crate::db::{json_to_sql, parse_json, Database};
+use crate::db::{json_text, json_to_sql, parse_json, Database};
 use crate::models::{Dependency, DependencyCondition, DependencyKind};
 use anyhow::Result;
 use rusqlite::params;
 
-const INSERT_DEPENDENCY: &str = r#"
+pub(crate) const INSERT_DEPENDENCY: &str = r#"
 INSERT INTO dependencies(from_task, to_task, kind, condition, metadata)
 VALUES (?1, ?2, ?3, ?4, ?5);
 "#;
@@ -42,7 +42,7 @@ fn row_to_dependency(row: &rusqlite::Row<'_>) -> rusqlite::Result<Dependency> {
             )),
         )
     };
-    let metadata: Option<String> = row.get(5)?;
+    let metadata = json_text(row, 5)?;
     Ok(Dependency {
         id: row.get(0)?,
         from_task: row.get(1)?,

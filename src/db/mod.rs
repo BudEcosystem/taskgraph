@@ -43,13 +43,14 @@ pub use projects::{
 pub use schema::init_db;
 pub use sweeper::{run_sweep, SweepResult};
 pub use tasks::{
-    amend_task_description, approve_task, batch_create_tasks, cancel_task, claim_next_task,
-    claim_task, complete_task, create_task, emit_due_wakes, fail_task, fuzzy_find_task,
-    get_handoff_context, get_lookahead, get_task, insert_task_between, list_due_wakes, list_tasks,
-    next_sleep_due_at, parse_sleep_duration_ms, pause_task, pivot_subtree, project_state,
-    promote_ready_tasks, resume_task, sleep_task, split_task, start_task, update_heartbeat,
-    update_progress, update_task, DueWake, HandoffEntry, LookaheadResult, NewSubtask, PivotResult,
-    ProjectState, ResumeResult, SleepResult, SplitPart, SplitResult, TaskListFilters,
+    amend_task_description, approve_task, batch_create_tasks, batch_create_tasks_with_edges,
+    cancel_task, claim_next_task, claim_task, complete_task, create_task, create_task_with_deps,
+    emit_due_wakes, fail_task, fuzzy_find_task, get_handoff_context, get_lookahead, get_task,
+    insert_task_between, list_due_wakes, list_tasks, next_sleep_due_at, parse_sleep_duration_ms,
+    pause_task, pivot_subtree, project_state, promote_ready_tasks, resume_task, sleep_task,
+    split_task, start_task, update_heartbeat, update_progress, update_task, DueWake, HandoffEntry,
+    LookaheadResult, NewSubtask, PivotResult, ProjectState, ResumeResult, SleepResult, SplitPart,
+    SplitResult, TaskListFilters,
 };
 
 #[derive(Debug, Error)]
@@ -127,6 +128,18 @@ pub(crate) fn json_to_sql(value: &Option<Value>) -> Result<Option<String>> {
         Some(v) => Ok(Some(serde_json::to_string(v)?)),
         None => Ok(None),
     }
+}
+
+/// Reads a `JSON` column as text. The type name gives the column NUMERIC affinity, so SQLite stores a numeric
+/// JSON value as INTEGER or REAL, and reading it as `String` fails.
+pub(crate) fn json_text(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<String>> {
+    use rusqlite::types::ValueRef;
+    Ok(match row.get_ref(idx)? {
+        ValueRef::Null => None,
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Real(f) => Some(f.to_string()),
+        ValueRef::Text(t) | ValueRef::Blob(t) => Some(String::from_utf8_lossy(t).into_owned()),
+    })
 }
 
 pub(crate) fn parse_json(value: Option<String>) -> Result<Option<Value>> {

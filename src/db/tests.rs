@@ -1109,3 +1109,112 @@ fn done_rejects_pending() {
     assert!(msg.contains("is 'pending'"));
     assert!(msg.contains("ready/claimed/running"));
 }
+
+fn project_tasks(db: &Database, project_id: &str) -> Vec<Task> {
+    let filters = TaskListFilters {
+        project_id: Some(project_id.to_owned()),
+        ..Default::default()
+    };
+    list_tasks(db, filters).unwrap()
+}
+
+#[test]
+fn scalar_and_object_results_read_back_and_hand_off() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "ResultTypes", None, None, None).unwrap();
+
+    for result in [json!(500500), json!(6.92), json!(true), json!({"sum": 5})] {
+        let upstream = create_task(
+            &db,
+            &make_task(&project.id, "upstream", TaskStatus::Ready),
+            &[],
+        )
+        .unwrap();
+        let downstream = create_task(
+            &db,
+            &make_task(&project.id, "downstream", TaskStatus::Pending),
+            &[],
+        )
+        .unwrap();
+        add_dependency(
+            &db,
+            &upstream.id,
+            &downstream.id,
+            DependencyKind::FeedsInto,
+            DependencyCondition::All,
+            None,
+        )
+        .unwrap();
+        complete_task(&db, &upstream.id, Some(result.clone())).unwrap();
+
+        assert_eq!(
+            get_task(&db, &upstream.id).unwrap().result,
+            Some(result.clone())
+        );
+        let handoff = get_handoff_context(&db, &downstream.id).unwrap();
+        assert_eq!(handoff.len(), 1);
+        assert_eq!(handoff[0].result, Some(result));
+    }
+    assert_eq!(project_tasks(&db, &project.id).len(), 8);
+}
+
+#[test]
+fn numeric_metadata_reads_back() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "NumericMetadata", None, None, None).unwrap();
+    let mut task = make_task(&project.id, "with metadata", TaskStatus::Ready);
+    task.metadata = Some(json!(42));
+
+    let created = create_task(&db, &task, &[]).unwrap();
+
+    assert_eq!(
+        get_task(&db, &created.id).unwrap().metadata,
+        Some(json!(42))
+    );
+}
+
+#[test]
+fn add_with_unknown_dependency_creates_nothing() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "AtomicAdd", None, None, None).unwrap();
+
+    let err = create_task_with_deps(
+        &db,
+        &make_task(&project.id, "orphan", TaskStatus::Pending),
+        &["tag-a".to_owned()],
+        &[("t-bogus1".to_owned(), DependencyKind::FeedsInto)],
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("t-bogus1"), "{err}");
+    assert!(project_tasks(&db, &project.id).is_empty());
+}
+
+#[test]
+fn batch_with_unknown_dependency_creates_nothing() {
+    let db_path = test_db_path();
+    let db = init_db(&db_path).unwrap();
+    let project = create_project(&db, "AtomicBatch", None, None, None).unwrap();
+    let first = make_task(&project.id, "first", TaskStatus::Pending);
+    let second = make_task(&project.id, "second", TaskStatus::Pending);
+    let edges = vec![
+        (
+            first.id.clone(),
+            second.id.clone(),
+            DependencyKind::FeedsInto,
+        ),
+        (
+            "t-bogus2".to_owned(),
+            second.id.clone(),
+            DependencyKind::FeedsInto,
+        ),
+    ];
+
+    let err = batch_create_tasks_with_edges(&db, &[first, second], &[], &edges).unwrap_err();
+
+    assert!(err.to_string().contains("t-bogus2"), "{err}");
+    assert!(project_tasks(&db, &project.id).is_empty());
+}
