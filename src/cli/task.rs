@@ -1343,9 +1343,9 @@ pub fn go_cmd(db: &Database, args: &GoArgs, json: bool) -> Result<()> {
 pub fn done_cmd(db: &Database, args: DoneArgs, json: bool, compact: bool) -> Result<()> {
     let result_provided = args.result.is_some();
     let result = match args.result {
-        Some(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-            Ok(v @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => Some(v),
-            _ => Some(serde_json::Value::String(text)),
+        Some(text) => match serde_json::from_str(&text) {
+            Ok(v) => Some(v),
+            Err(_) => Some(serde_json::Value::String(text)),
         },
         None => None,
     };
