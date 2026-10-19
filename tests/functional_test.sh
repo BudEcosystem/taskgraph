@@ -763,6 +763,37 @@ assert_contains "task split response has effect" '"effect"' "$SPLIT_OUT"
 echo ""
 
 # ─────────────────────────────────────────────
+echo "RESULT TYPES"
+
+RT_PROJECT=$($TASKGRAPH --db "$DB" --json project create "result-types")
+RT_PROJECT_ID=$(jq_field "$RT_PROJECT" "id")
+RT_A=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$RT_PROJECT_ID" --title "RT A")" "id")
+RT_B=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$RT_PROJECT_ID" --title "RT B" --dep "$RT_A")" "id")
+RT_C=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$RT_PROJECT_ID" --title "RT C" --dep "$RT_B")" "id")
+$TASKGRAPH --db "$DB" go --project "$RT_PROJECT_ID" --agent rt >/dev/null
+NUM_OUT=$($TASKGRAPH --db "$DB" done "$RT_A" --result 500500 --next --agent rt 2>&1)
+assert_contains "numeric result is handed off" "500500" "$NUM_OUT"
+RT_LIST=$($TASKGRAPH --db "$DB" --json list --project "$RT_PROJECT_ID")
+assert_eq "list reads a project holding numeric results" "3" "$(jq_len "$RT_LIST")"
+LONG_RESULT="Größenänderung über alle Prüfungen hinweg — äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß äöüß"
+NA_PROJECT_ID=$(jq_field "$($TASKGRAPH --db "$DB" --json project create "non-ascii-results")" "id")
+NA_A=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$NA_PROJECT_ID" --title "NA A")" "id")
+$TASKGRAPH --db "$DB" --json task create --project "$NA_PROJECT_ID" --title "NA B" --dep "$NA_A" >/dev/null
+$TASKGRAPH --db "$DB" go --project "$NA_PROJECT_ID" --agent rt >/dev/null
+NA_EXIT=0
+$TASKGRAPH --db "$DB" done "$NA_A" --result "$LONG_RESULT" --next --agent rt >/dev/null 2>&1 || NA_EXIT=$?
+assert_eq "long non-ASCII result is handed off" "0" "$NA_EXIT"
+
+OBJ_PROJECT_ID=$(jq_field "$($TASKGRAPH --db "$DB" --json project create "object-results")" "id")
+OBJ_A=$(jq_field "$($TASKGRAPH --db "$DB" --json task create --project "$OBJ_PROJECT_ID" --title "OBJ A")" "id")
+$TASKGRAPH --db "$DB" --json task create --project "$OBJ_PROJECT_ID" --title "OBJ B" --dep "$OBJ_A" >/dev/null
+$TASKGRAPH --db "$DB" go --project "$OBJ_PROJECT_ID" --agent rt >/dev/null
+OBJ_OUT=$($TASKGRAPH --db "$DB" done "$OBJ_A" --result '{"sum": 5}' --next --agent rt 2>&1)
+assert_contains "object result is shown downstream" '{"sum":5}' "$OBJ_OUT"
+
+echo ""
+
+# ─────────────────────────────────────────────
 # SUMMARY
 echo "=========================================="
 echo "  RESULTS"

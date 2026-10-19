@@ -1302,18 +1302,17 @@ pub fn go_cmd(db: &Database, args: &GoArgs, json: bool) -> Result<()> {
                 eprintln!("upstream:");
                 for h in handoff {
                     let from_id = h["from_task"].as_str().unwrap_or("");
-                    let result = h["result"]
-                        .as_str()
-                        .or_else(|| {
-                            if h["result"].is_null() {
-                                None
-                            } else {
-                                Some("(structured)")
-                            }
-                        })
-                        .unwrap_or("(no result)");
-                    let result_display = if result.len() > 120 {
-                        format!("{}…", &result[..117])
+                    let rendered = if h["result"].is_null() {
+                        "(no result)".to_string()
+                    } else {
+                        h["result"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| h["result"].to_string())
+                    };
+                    let result = rendered.as_str();
+                    let result_display = if result.chars().count() > 120 {
+                        format!("{}…", result.chars().take(117).collect::<String>())
                     } else {
                         result.to_string()
                     };
@@ -1409,9 +1408,17 @@ pub fn done_cmd(db: &Database, args: DoneArgs, json: bool, compact: bool) -> Res
             if let Some(handoff) = n["handoff"].as_array() {
                 for h in handoff {
                     let from_id = h["from_task"].as_str().unwrap_or("");
-                    let result_str = h["result"].as_str().unwrap_or("(no result)");
-                    let display = if result_str.len() > 120 {
-                        format!("{}…", &result_str[..117])
+                    let rendered = if h["result"].is_null() {
+                        "(no result)".to_string()
+                    } else {
+                        h["result"]
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| h["result"].to_string())
+                    };
+                    let result_str = rendered.as_str();
+                    let display = if result_str.chars().count() > 120 {
+                        format!("{}…", result_str.chars().take(117).collect::<String>())
                     } else {
                         result_str.to_string()
                     };
